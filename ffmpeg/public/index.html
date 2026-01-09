@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>FFmpeg Stream Tester</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        #logs { background: #f4f4f4; padding: 15px; margin-top: 15px; border: 1px solid #ddd; font-family: monospace; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h1>FFmpeg Stream Tester</h1>
+    <p>Select a <strong>.webm</strong> file to stream to the backend.</p>
+
+    <input type="file" id="videoInput" accept=".webm" />
+    <button onclick="startStream()">Start Upload Stream</button>
+
+    <h3>Status: <span id="status">Idle</span></h3>
+    <div id="logs">Logs will appear here...</div>
+
+    <script>
+        async function startStream() {
+            const input = document.getElementById('videoInput');
+            const status = document.getElementById('status');
+            const logs = document.getElementById('logs');
+
+            if (!input.files[0]) {
+                alert("Please select a file first");
+                return;
+            }
+
+            const file = input.files[0];
+            const roomId = "test-room-1"; 
+
+            // Clear previous logs
+            logs.innerHTML = "";
+            status.innerText = "Uploading...";
+            logs.innerHTML += `> Starting stream for: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)\n`;
+
+            try {
+                // --- THE MAGIC FIX ---
+                // We send the 'file' object directly. 
+                // This mimics "curl --data-binary @file" exactly.
+                const response = await fetch(`/stream?roomId=${roomId}`, {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/octet-stream' // Vital: Tells server it's raw video
+                    },
+                    body: file // Sending 'file' directly is safer than file.stream() for compatibility
+                });
+
+                if (response.ok) {
+                    status.innerText = "Stream Request Sent!";
+                    const responseText = await response.text();
+                    logs.innerHTML += `> Server Responded: 200 OK\n`;
+                    logs.innerHTML += `> Server Message: ${responseText}\n`;
+                    logs.innerHTML += `> SUCCESS: Check your Docker logs now!`;
+                } else {
+                    status.innerText = "Server Error";
+                    logs.innerHTML += `> Error ${response.status}: ${response.statusText}\n`;
+                }
+            } catch (err) {
+                console.error(err);
+                status.innerText = "Connection Failed";
+                logs.innerHTML += `> Network Error: ${err.message}\n`;
+            }
+        }
+    </script>
+</body>
+</html>

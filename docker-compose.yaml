@@ -13,3 +13,41 @@ services:
       - /app/node_modules
     command: npm run dev
     restart: unless-stopped
+
+  ffmpeg-service:
+    build:
+      context: ./ffmpeg # Assumes your folder is named 'ffmpeg'
+      dockerfile: Dockerfile
+    container_name: streamsync-ffmpeg
+    ports:
+      - "4000:3000" # Host Port 4000 -> Container Port 3000 (Avoids conflict)
+    volumes:
+      - ./ffmpeg/src:/app/src
+    # Mount the RAM disk to where your code writes files
+      - hls_ram_disk:/hls
+    # OPTIONAL: Map your local code for hot-reloading during dev
+      - ./ffmpeg/src:/app/src
+    environment:
+      - NODE_ENV=development
+
+  nginx-server:
+    image: nginx:alpine
+    container_name: streamsync-nginx
+    ports:
+      - "8080:80" # Users access the video stream here (e.g., http://localhost:8080/hls/...)
+    volumes:
+    # Read-only access to the same RAM disk to serve the files
+      - hls_ram_disk:/usr/share/nginx/html/hls:ro
+    # Map a simple Nginx config (Create this file, see below)
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+
+# -------------------------------------------------------
+# Shared Volumes (RAM Disk)
+# -------------------------------------------------------
+volumes:
+  hls_ram_disk:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=512m,uid=1000" # 512MB limit

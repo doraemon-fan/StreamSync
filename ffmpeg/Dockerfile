@@ -21,7 +21,7 @@ COPY . .
 RUN npm run build
 
 # 6. Create the HLS output directory
-RUN mkdir -p /hls
+RUN mkdir -p /hls && mkdir -p /temp
 
 # 7. Start the server
-CMD ["node", "dist/server.js"]
+CMD ["npm", "run", "dev"]

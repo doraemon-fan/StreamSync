@@ -24,9 +24,9 @@ services:
     volumes:
       - ./ffmpeg/src:/app/src
     # Mount the RAM disk to where your code writes files
+      - ./ffmpeg/public:/app/public
       - hls_ram_disk:/hls
     # OPTIONAL: Map your local code for hot-reloading during dev
-      - ./ffmpeg/src:/app/src
     environment:
       - NODE_ENV=development
 

@@ -13,6 +13,7 @@ WORKDIR /app
 # 3. Install Node dependencies
 COPY package*.json ./
 RUN npm install
+RUN npm install -g nodemon ts-node
 
 # 4. Copy source code
 COPY . .
@@ -21,7 +22,7 @@ COPY . .
 RUN npm run build
 
 # 6. Create the HLS output directory
-RUN mkdir -p /hls
+RUN mkdir -p /hls && mkdir -p /temp
 
 # 7. Start the server
-CMD ["node", "dist/server.js"]
+CMD ["npm", "run", "dev"]

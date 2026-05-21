@@ -12,6 +12,8 @@ COPY . .
 
 RUN npm run build
 
+RUN npm install -g nodemon tsx
+
 # RUN apk add --no-cache bash ffmpeg
 
 EXPOSE 3000

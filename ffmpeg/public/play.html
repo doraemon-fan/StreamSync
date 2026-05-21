@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>StreamSync — Player</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  </head>
+  <body
+    style="
+      font-family: sans-serif;
+      max-width: 700px;
+      margin: 3rem auto;
+      padding: 1rem;
+    "
+  >
+    <h2 id="roomLabel">Room: loading...</h2>
+    <video
+      id="player"
+      controls
+      style="width: 100%; background: #000; border-radius: 8px"
+    ></video>
+
+    <p id="status" style="font-size: 13px; color: #666; margin-top: 8px">
+      Connecting to stream...
+    </p>
+
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      const roomId = params.get("roomId") || "default-room";
+      document.getElementById("roomLabel").textContent = "Room: " + roomId;
+      const hlsUrl = `/hls/${roomId}/index.m3u8`;
+      const video = document.getElementById("player");
+      const status = document.getElementById("status");
+      if (Hls.isSupported()) {
+        const hls = new Hls({
+          liveSyncDurationCount: 3,
+          liveMaxLatencyDurationCount: 6,
+        });
+        hls.loadSource(hlsUrl);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          status.textContent = "Stream ready — playing";
+          video.play();
+        });
+        hls.on(Hls.Events.ERROR, (event, data) => {
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            status.textContent = "Waiting for stream to start...";
+            setTimeout(() => {
+              hls.loadSource(hlsUrl);
+            }, 3000);
+          }
+        });
+      } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = hlsUrl;
+        video.addEventListener("loadedmetadata", () => video.play());
+        status.textContent = "Stream ready (native HLS)";
+      } else {
+        status.textContent = "HLS not supported in this browser";
+      }
+    </script>
+  </body>
+</html>

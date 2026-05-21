@@ -13,6 +13,7 @@ WORKDIR /app
 # 3. Install Node dependencies
 COPY package*.json ./
 RUN npm install
+RUN npm install -g nodemon ts-node
 
 # 4. Copy source code
 COPY . .

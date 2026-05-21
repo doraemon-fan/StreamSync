@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>StreamSync — Upload</title>
+  </head>
+  <body
+    style="
+      font-family: sans-serif;
+      max-width: 500px;
+      margin: 3rem auto;
+      padding: 1rem;
+    "
+  >
+    <h2>Upload Video</h2>
+
+    <label>Room ID</label><br />
+    <input
+      type="text"
+      id="roomId"
+      placeholder="room-abc123"
+      style="width: 100%; margin-bottom: 1rem; padding: 8px"
+    /><br />
+
+    <input type="file" id="fileInput" accept="video/*" /><br /><br />
+
+    <button onclick="startUpload()">Upload & Stream</button>
+
+    <div style="margin-top: 1rem">
+      <div
+        id="progressWrap"
+        style="background: #eee; border-radius: 4px; height: 8px; display: none"
+      >
+        <div
+          id="progressBar"
+          style="
+            height: 100%;
+            width: 0%;
+            background: #378add;
+            border-radius: 4px;
+            transition: width 0.2s;
+          "
+        ></div>
+      </div>
+      <p id="status" style="font-size: 13px; color: #666; margin-top: 8px"></p>
+    </div>
+
+    <script>
+      const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB per chunk
+
+      async function startUpload() {
+        const file = document.getElementById("fileInput").files[0];
+        const roomId =
+          document.getElementById("roomId").value.trim() || "default-room";
+        if (!file) return alert("Pick a file first");
+
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        document.getElementById("progressWrap").style.display = "block";
+        setStatus("Starting...");
+
+        // 1. Signal start
+        await fetch("/upload/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ roomId, totalChunks, fileName: file.name }),
+        });
+
+        // 2. Send chunks one by one
+        for (let i = 0; i < totalChunks; i++) {
+          const chunk = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+          const form = new FormData();
+          form.append("roomId", roomId);
+          form.append("chunkIndex", String(i));
+          form.append("totalChunks", String(totalChunks));
+          form.append("chunk", chunk);
+
+          await fetch("/upload/chunk", { method: "POST", body: form });
+
+          const pct = Math.round(((i + 1) / totalChunks) * 100);
+          document.getElementById("progressBar").style.width = pct + "%";
+          setStatus(`Uploading... ${pct}%`);
+        }
+
+        // 3. Signal complete → server pipes to FFmpeg
+        await fetch("/upload/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ roomId }),
+        });
+
+        setStatus("Processing... redirecting to player");
+        setTimeout(() => {
+          window.location.href = `/play.html?roomId=${roomId}`;
+        }, 2000);
+      }
+
+      function setStatus(msg) {
+        document.getElementById("status").textContent = msg;
+      }
+    </script>
+  </body>
+</html>

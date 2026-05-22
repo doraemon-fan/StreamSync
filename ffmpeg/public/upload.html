@@ -54,7 +54,7 @@
           document.getElementById("roomId").value.trim() || "default-room";
         if (!file) return alert("Pick a file first");
 
-        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const totalChunk = Math.ceil(file.size / CHUNK_SIZE);
         document.getElementById("progressWrap").style.display = "block";
         setStatus("Starting...");
 
@@ -62,21 +62,21 @@
         await fetch("/upload/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ roomId, totalChunks, fileName: file.name }),
+          body: JSON.stringify({ roomId, totalChunk, fileName: file.name }),
         });
 
         // 2. Send chunks one by one
-        for (let i = 0; i < totalChunks; i++) {
+        for (let i = 0; i < totalChunk; i++) {
           const chunk = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
           const form = new FormData();
           form.append("roomId", roomId);
           form.append("chunkIndex", String(i));
-          form.append("totalChunks", String(totalChunks));
+          form.append("totalChunk", String(totalChunk));
           form.append("chunk", chunk);
 
           await fetch("/upload/chunk", { method: "POST", body: form });
 
-          const pct = Math.round(((i + 1) / totalChunks) * 100);
+          const pct = Math.round(((i + 1) / totalChunk) * 100);
           document.getElementById("progressBar").style.width = pct + "%";
           setStatus(`Uploading... ${pct}%`);
         }

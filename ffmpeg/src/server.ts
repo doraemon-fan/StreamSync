@@ -18,7 +18,7 @@ const uploadSessions: Record<
   string,
   {
     totalChunk: number;
-    receivedChunks: number;
+    receivedChunk: number;
     fileName: string;
   }
 > = {};
@@ -26,7 +26,8 @@ const uploadSessions: Record<
 //START
 
 app.post("/upload/start", (req, res) => {
-  const { roomId, totalChunk, fileName } = req.body;
+  const { roomId, fileName } = req.body;
+  const totalChunk = Number(req.body.totalChunk);
 
   const roomHLS = path.join(HLS_DIR, roomId);
   const roomTemp = path.join(TEMP_DIR, roomId);
@@ -37,31 +38,16 @@ app.post("/upload/start", (req, res) => {
   const tempFile = path.join(roomTemp, "upload.tmp");
   if (fs.existsSync(tempFile)) fs.rmSync(tempFile);
 
-  uploadSessions[roomId] = { totalChunk, receivedChunks: 0, fileName };
-
+  uploadSessions[roomId] = { totalChunk, receivedChunk: 0, fileName };
   console.log(`[Start] Room: ${roomId} | Chunks expected: ${totalChunk}`);
-  app.post("/upload/chunk", upload.single("chunk"), (req, res) => {
-    const { roomId, chunkIndex, totalChunks } = req.body;
-    const chunk = req.file?.buffer;
-
-    if (!chunk) return res.status(400).json({ error: "no chunk" });
-
-    const tempFile = path.join(TEMP_DIR, roomId, "upload.tmp");
-
-    // append chunk to temp file — this is how we reassemble
-    fs.appendFileSync(tempFile, chunk);
-
-    uploadSessions[roomId].receivedChunks++;
-    console.log(`[Chunk] Room: ${roomId} | ${chunkIndex}/${totalChunks}`);
-
-    res.json({ ok: true });
-  });
   res.json({ ok: true });
 });
 
 //CHUNK
 app.post("/upload/chunk", upload.single("chunk"), (req, res) => {
-  const { roomId, chunkIndex, totalChunks } = req.body;
+  const { roomId } = req.body;
+  const chunkIndex = Number(req.body.chunkIndex);
+  const totalChunk = Number(req.body.totalChunk);
   const chunk = req.file?.buffer;
 
   if (!chunk) return res.status(400).json({ error: "no chunk" });
@@ -70,8 +56,8 @@ app.post("/upload/chunk", upload.single("chunk"), (req, res) => {
 
   fs.appendFileSync(tempFile, chunk);
 
-  uploadSessions[roomId].receivedChunks++;
-  console.log(`[Chunk] Room: ${roomId} | ${chunkIndex}/${totalChunks}`);
+  uploadSessions[roomId].receivedChunk++;
+  console.log(`[Chunk] Room: ${roomId} | ${chunkIndex}/${totalChunk}`);
 
   res.json({ ok: true });
 });
@@ -84,7 +70,7 @@ app.post("/upload/complete", (req, res) => {
   if (!session) return res.status(400).json({ error: "no session found" });
 
   console.log(`[Complete] Room: ${roomId} — starting FFmpeg`);
-  res.json({ ok: true }); // respond immediately, FFmpeg runs in background
+  res.json({ ok: true });
 
   const tempFile = path.join(TEMP_DIR, roomId, "upload.tmp");
   const roomHLS = path.join(HLS_DIR, roomId);

@@ -3,6 +3,7 @@ import http from "http"
 import { Server } from "socket.io"
 import cors from "cors"
 import roomRoutes from "./routes/room"
+import { registerSyncHandlers } from "./sockets/sync"
 
 const app = express()
 app.use(cors())
@@ -16,8 +17,10 @@ const server = http.createServer(app)
 const io = new Server(server, { cors: { origin: "*" } })
 
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id)
-  socket.on("disconnect", () => console.log("User disconnected:", socket.id))
+  console.log(`[socket] Connected: ${socket.id}`)
+  registerSyncHandlers(io, socket)
+
+  socket.on("disconnect", () => console.log(`[socket] disconnected: ${socket.id}`))
 })
 
 const PORT = process.env.PORT || 5000

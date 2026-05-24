@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Sync Test</title>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body>
+  <h2>Sync Tester</h2>
+  <input id="name" placeholder="your name (ryuk/light)" />
+  <input id="roomId" placeholder="roomId" />
+  <button onclick="joinRoom()">Join Room</button>
+  <br/><br/>
+  <button onclick="emitPlay()">Play</button>
+  <button onclick="emitPause()">Pause</button>
+  <input id="seekTime" placeholder="seek to (seconds)" />
+  <button onclick="emitSeek()">Seek</button>
+  <br/><br/>
+  <div id="log" style="font-family:monospace; background:#111; color:#0f0; padding:1rem;"></div>
+
+  <script>
+    const socket = io("http://localhost:5000")
+    let currentRoom = null
+
+    socket.on("connect", () => log("connected: " + socket.id))
+
+    socket.on("sync-state", (data) => log("SYNC STATE: " + JSON.stringify(data)))
+    socket.on("play",        (data) => log("PLAY: " + JSON.stringify(data)))
+    socket.on("pause",       (data) => log("PAUSE: " + JSON.stringify(data)))
+    socket.on("seek",        (data) => log("SEEK: " + JSON.stringify(data)))
+    socket.on("member-joined",(data) => log("JOINED: " + JSON.stringify(data)))
+    socket.on("member-left", (data) => log("LEFT: " + JSON.stringify(data)))
+    socket.on("error",       (data) => log("ERROR: " + JSON.stringify(data)))
+
+    function joinRoom() {
+      currentRoom = document.getElementById("roomId").value
+      const name  = document.getElementById("name").value
+      socket.emit("join-room", { roomId: currentRoom, memberName: name })
+      log("joining room: " + currentRoom + " as " + name)
+    }
+
+    function emitPlay()  { socket.emit("play",  { roomId: currentRoom, timestamp: 10.0 }) }
+    function emitPause() { socket.emit("pause", { roomId: currentRoom, timestamp: 10.0 }) }
+    function emitSeek()  {
+      const t = parseFloat(document.getElementById("seekTime").value)
+      socket.emit("seek", { roomId: currentRoom, timestamp: t })
+    }
+
+    function log(msg) {
+      document.getElementById("log").innerHTML += msg + "<br/>"
+    }
+  </script>
+</body>
+</html>

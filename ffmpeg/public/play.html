@@ -1,62 +1,142 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <title>StreamSync — Player</title>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  </head>
-  <body
-    style="
-      font-family: sans-serif;
-      max-width: 700px;
-      margin: 3rem auto;
-      padding: 1rem;
-    "
-  >
-    <h2 id="roomLabel">Room: loading...</h2>
-    <video
-      id="player"
-      controls
-      style="width: 100%; background: #000; border-radius: 8px"
-    ></video>
+<head>
+  <meta charset="UTF-8" />
+  <title>StreamSync — Player</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body style="font-family: sans-serif; max-width: 700px; margin: 3rem auto; padding: 1rem;">
 
-    <p id="status" style="font-size: 13px; color: #666; margin-top: 8px">
-      Connecting to stream...
-    </p>
+  <h2 id="roomLabel">Room: loading...</h2>
 
-    <script>
-      const params = new URLSearchParams(window.location.search);
-      const roomId = params.get("roomId") || "default-room";
-      document.getElementById("roomLabel").textContent = "Room: " + roomId;
-      const hlsUrl = `/hls/${roomId}/index.m3u8`;
-      const video = document.getElementById("player");
-      const status = document.getElementById("status");
+  <!-- name input shown before joining -->
+  <div id="joinBox">
+    <input id="memberName" placeholder="your name" style="padding:8px; margin-right:8px;" />
+    <button onclick="joinRoom()">Join Room</button>
+  </div>
+
+  <br/>
+
+  <video
+    id="player"
+    controls
+    style="width: 100%; background: #000; border-radius: 8px; display:none;"
+  ></video>
+
+  <p id="status" style="font-size:13px; color:#666; margin-top:8px;">
+    Enter your name and join the room.
+  </p>
+
+  <script>
+    //SETUP
+    const params   = new URLSearchParams(window.location.search)
+    const roomId   = params.get('roomId') || 'default-room'
+    const hlsUrl   = `/hls/${roomId}/index.m3u8`
+    const video    = document.getElementById('player')
+    const status   = document.getElementById('status')
+    document.getElementById('roomLabel').textContent = 'Room: ' + roomId
+    const socket = io('http://localhost:5000')
+
+    let isSyncing = false
+    //JOIN
+    function joinRoom() {
+      const name = document.getElementById('memberName').value.trim()
+      if (!name) return alert('Enter your name')
+
+      socket.emit('join-room', { roomId, memberName: name })
+
+      document.getElementById('joinBox').style.display = 'none'
+      document.getElementById('player').style.display  = 'block'
+
+      setStatus('Joined room — waiting for stream...')
+      loadPlayer()
+    }
+    //HLS PLAYER
+    function loadPlayer() {
       if (Hls.isSupported()) {
-        const hls = new Hls({
-          liveSyncDurationCount: 3,
-          liveMaxLatencyDurationCount: 6,
-        });
-        hls.loadSource(hlsUrl);
-        hls.attachMedia(video);
+        const hls = new Hls({ liveSyncDurationCount: 3 })
+        hls.loadSource(hlsUrl)
+        hls.attachMedia(video)
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          status.textContent = "Stream ready — playing";
-          video.play();
-        });
+          setStatus('Stream ready')
+        })
+
         hls.on(Hls.Events.ERROR, (event, data) => {
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            status.textContent = "Waiting for stream to start...";
-            setTimeout(() => {
-              hls.loadSource(hlsUrl);
-            }, 3000);
+            setStatus('Waiting for stream...')
+            setTimeout(() => hls.loadSource(hlsUrl), 3000)
           }
-        });
-      } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-        video.src = hlsUrl;
-        video.addEventListener("loadedmetadata", () => video.play());
-        status.textContent = "Stream ready (native HLS)";
-      } else {
-        status.textContent = "HLS not supported in this browser";
+        })
+
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = hlsUrl
       }
-    </script>
-  </body>
+    }
+
+    //OUTGOING EVENTS (user controls video)
+    video.addEventListener('play', () => {
+      if (isSyncing) return   // don't echo back received events
+      socket.emit('play', { roomId, timestamp: video.currentTime })
+    })
+
+    video.addEventListener('pause', () => {
+      if (isSyncing) return
+      socket.emit('pause', { roomId, timestamp: video.currentTime })
+    })
+
+    video.addEventListener('seeked', () => {
+      if (isSyncing) return
+      socket.emit('seek', { roomId, timestamp: video.currentTime })
+    })
+
+    //INCOMING EVENTS (someone else controls)
+    socket.on('play', ({ timestamp }) => {
+      isSyncing = true
+      video.currentTime = timestamp
+      video.play().finally(() => { isSyncing = false })
+      setStatus('▶ someone played')
+    })
+
+    socket.on('pause', ({ timestamp }) => {
+      isSyncing = true
+      video.currentTime = timestamp
+      video.pause()
+      isSyncing = false
+      setStatus('⏸ someone paused')
+    })
+
+    socket.on('seek', ({ timestamp }) => {
+      isSyncing = true
+      video.currentTime = timestamp
+      isSyncing = false
+      setStatus('⏩ someone seeked to ' + Math.round(timestamp) + 's')
+    })
+
+    //late joiner
+    socket.on('sync-state', ({ isPlaying, timestamp }) => {
+      isSyncing = true
+      video.currentTime = timestamp
+      if (isPlaying) {
+        video.play().finally(() => { isSyncing = false })
+      } else {
+        video.pause()
+        isSyncing = false
+      }
+      setStatus('synced to ' + Math.round(timestamp) + 's')
+    })
+
+    socket.on('member-joined', ({ memberName }) => {
+      setStatus(memberName + ' joined the room')
+    })
+
+    socket.on('member-left', () => {
+      setStatus('someone left the room')
+    })
+
+    function setStatus(msg) {
+      status.textContent = msg
+    }
+  </script>
+</body>
 </html>

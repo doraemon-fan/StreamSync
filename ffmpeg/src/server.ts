@@ -3,6 +3,7 @@ import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 import multer from "multer";
+import http from "http";
 
 const app = express();
 const PORT = 3000;
@@ -113,6 +114,8 @@ function runFFmpeg(inputFile: string, outputDir: string, roomId: string) {
     console.log(`[FFmpeg] Done for room: ${roomId} — exit code: ${code}`);
     fs.rmSync(path.join(TEMP_DIR, roomId), { recursive: true, force: true });
     delete uploadSessions[roomId];
+
+    if (code === 0) notifyBackend(roomId);
   });
 
   ffmpeg.on("error", (err) => {
@@ -123,6 +126,31 @@ function runFFmpeg(inputFile: string, outputDir: string, roomId: string) {
 //SERVE HLS
 
 app.use("/hls", express.static(HLS_DIR));
+
+//call backend for isReady
+function notifyBackend(roomId: string) {
+  const data = JSON.stringify({ roomId });
+
+  const options = {
+    hostname: "backend",
+    port: 5000,
+    path: "/room/ready",
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(data),
+    },
+  };
+  const req = http.request(options, (res) => {
+    console.log(`[Notify] Backend responded: ${res.statusCode}`);
+  });
+  req.on("error", (err) => {
+    console.error(`[Notify] Failed to reach backend: ${err.message}`);
+  });
+
+  req.write(data);
+  req.end();
+}
 
 app.listen(PORT, () => {
   console.log(`FFmpeg service running on PORT :${PORT}`);

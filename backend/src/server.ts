@@ -6,13 +6,25 @@ import { createRoomRouter } from "./routes/room";
 import { registerSyncHandlers } from "./sockets/sync";
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: ["http://localhost:3001", "http://localhost:4000"],
+    methods: ["GET", "POST"],
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
 app.get("/api/ping", (req, res) => res.json({ message: "pong" }));
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, {
+  cors: {
+    origin: ["http://localhost:3001", "http://localhost:4000"],
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
+});
 
 app.use("/room", createRoomRouter(io));
 

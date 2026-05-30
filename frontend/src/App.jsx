@@ -1,29 +1,14 @@
-import React, { useState } from 'react'
-import { BrowserRouter, Routes, Route, Link } from 'react-router-dom';
-import TestUploadPage from '../components/TestFeature/TestUploadPage';
-import ViewVideoPage from '../components/TestFeature/ViewVideoPage';
-import './App.css'
+import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import HomePage from '../pages/HomePage'
+import RoomPage from '../pages/RoomPage'
 
-function App() {
+export default function App() {
   return (
-    <>
-      <BrowserRouter>
-        <header style={{ padding: 12, borderBottom: '1px solid #e5e7eb' }}>
-          <nav style={{ display: 'flex', gap: 12 }}>
-            <Link to="/">Home</Link>
-            <Link to="/test-upload">Test Upload</Link>
-          </nav>
-        </header>
-
-        <main style={{ padding: 20 }}>
-          <Routes>
-            <Route path="/test-upload" element={<TestUploadPage />} />
-            <Route path="/view-video" element={<ViewVideoPage />} />
-          </Routes>
-        </main>
-      </BrowserRouter>
-    </>
+    <BrowserRouter>
+      <Routes>
+        <Route path="/"           element={<HomePage />} />
+        <Route path="/room/:roomId" element={<RoomPage />} />
+      </Routes>
+    </BrowserRouter>
   )
 }
-
-export default App

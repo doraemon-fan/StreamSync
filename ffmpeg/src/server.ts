@@ -4,12 +4,16 @@ import fs from "fs";
 import path from "path";
 import multer from "multer";
 import http from "http";
+import cors from "cors";
 
 const app = express();
 const PORT = 3000;
 const HLS_DIR = "/hls";
 const TEMP_DIR = "/temp";
 
+app.use(cors({
+  origin: 'http://localhost:3001'
+}))
 app.use(express.json());
 app.use(express.static("public"));
 

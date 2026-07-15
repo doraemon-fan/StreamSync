@@ -25,13 +25,21 @@ export function registerSyncHandlers(io: Server, socket: Socket) {
     }
 
     socket.join(roomId);
-    console.log(`[Sync] ${memberName} joined the room: ${roomId}`);
+    (socket as any).memberName = memberName;
+    (socket as any).currentRoomId = roomId;
+
+    console.log(`[Sync] ${memberName} joined room: ${roomId}`);
+    
+        const host = room.members.find((m) => m.isAdmin);
+    if (host) {
+      socket.emit("room-info", { hostName: host.name });
+    }
 
     if (roomState[roomId]) {
       const state = roomState[roomId];
 
       const elapsed = state.isPlaying
-        ? (Date.now() - state.updatedAt) / 100
+        ? (Date.now() - state.updatedAt) / 1000
         : 0;
 
       const currentTimestamp = state.timestamp + elapsed;
@@ -81,9 +89,10 @@ export function registerSyncHandlers(io: Server, socket: Socket) {
   
   //LEAVE
   socket.on("disconnecting", () => {
+    const memberName = (socket as any).memberName;
     socket.rooms.forEach(roomId => {
-      socket.to(roomId).emit("member-left", { socketId: socket.id })
-      console.log(`[Sync] Socket ${socket.id} left room: ${roomId}`)
+      socket.to(roomId).emit("member-left", { memberName })
+      console.log(`[Sync] ${memberName ?? socket.id} left room: ${roomId}`);
     })
   })
 

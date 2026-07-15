@@ -1,106 +1,144 @@
-// frontend/pages/RoomPage.jsx
+
 import { useState, useEffect, useRef } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { BACKEND_URL, FFMPEG_URL } from "../src/config";
 import { io } from "socket.io-client";
 import Hls from "hls.js";
-
+ 
 const CHUNK_SIZE = 2 * 1024 * 1024;
-
+ 
 export default function RoomPage() {
   const { roomId } = useParams();
   const [searchParams] = useSearchParams();
   const name = searchParams.get("name") || "guest";
   const role = searchParams.get("role") || "member";
   const isAdmin = role === "admin";
-
+ 
   const [status, setStatus] = useState("connecting...");
   const [members, setMembers] = useState([]);
+  const [hostName, setHostName] = useState("host");
   const [isReady, setIsReady] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [ts, setTs] = useState("");
-
+ 
   const videoRef = useRef(null);
   const socketRef = useRef(null);
-  const isSyncing = useRef(false);
+  // FIX: counter instead of boolean — survives async seek events
+  const syncDepth = useRef(0);
   const hlsRef = useRef(null);
-
+  const streamPollRef = useRef(null);
+ 
+  // helpers — every programmatic video touch must wrap with these
+  function beginSync() { syncDepth.current += 1; }
+  function endSync()   { if (syncDepth.current > 0) syncDepth.current -= 1; }
+  function isSyncing() { return syncDepth.current > 0; }
+ 
+  // seekTo: sets currentTime and accounts for the seeked event that will fire
+  function seekTo(timestamp) {
+    beginSync(); // will be decremented in handleSeeked
+    videoRef.current.currentTime = timestamp;
+  }
+ 
+  function startStreamPoll() {
+    if (streamPollRef.current) return;
+    streamPollRef.current = setInterval(() => {
+      fetch(`${BACKEND_URL}/room/${roomId}`)
+        .then((r) => r.json())
+        .then((d) => {
+          if (d.room?.isReady) {
+            clearInterval(streamPollRef.current);
+            streamPollRef.current = null;
+            setIsReady(true);
+            setStatus("stream ready — loading player");
+            loadPlayer();
+          }
+        })
+        .catch(() => {});
+    }, 2000);
+  }
+ 
   useEffect(() => {
     setTs(new Date().toISOString().slice(0, 19).replace("T", " "));
+    if (isAdmin) setHostName(name);
+ 
     const socket = io(BACKEND_URL);
     socketRef.current = socket;
-
+ 
     socket.on("connect", () => {
       socket.emit("join-room", { roomId, memberName: name });
       setStatus("joined room — waiting for stream");
     });
+ 
     socket.on("stream-ready", () => {
+      if (streamPollRef.current) {
+        clearInterval(streamPollRef.current);
+        streamPollRef.current = null;
+      }
       setIsReady(true);
       setStatus("stream ready — loading player");
       loadPlayer();
     });
+ 
     socket.on("play", ({ timestamp }) => {
       if (!videoRef.current) return;
       if (!hlsRef.current) {
         loadPlayer();
         setTimeout(() => {
-          isSyncing.current = true;
-          videoRef.current.currentTime = timestamp;
-          videoRef.current.play().finally(() => {
-            isSyncing.current = false;
-          });
+          beginSync();
+          seekTo(timestamp);
+          videoRef.current.play().finally(() => endSync());
         }, 1000);
         return;
       }
-
-      isSyncing.current = true;
-      videoRef.current.currentTime = timestamp;
-      videoRef.current.play().finally(() => {
-        isSyncing.current = false;
-      });
+      beginSync();
+      seekTo(timestamp);
+      videoRef.current.play().finally(() => endSync());
       setStatus("▶ playing");
     });
+ 
     socket.on("pause", ({ timestamp }) => {
       if (!videoRef.current) return;
-      if (!hlsRef.current) {
-        loadPlayer();
-        return;
-      }
-
-      isSyncing.current = true;
-      videoRef.current.currentTime = timestamp;
+      if (!hlsRef.current) { loadPlayer(); return; }
+      beginSync();
+      seekTo(timestamp);
       videoRef.current.pause();
-      isSyncing.current = false;
+      // pause doesn't fire seeked so end immediately after seek lands
+      // handleSeeked will endSync for the seekTo, pause needs its own end
+      endSync();
       setStatus("⏸ paused");
     });
+ 
     socket.on("seek", ({ timestamp }) => {
       if (!videoRef.current) return;
-      isSyncing.current = true;
-      videoRef.current.currentTime = timestamp;
-      isSyncing.current = false;
+      seekTo(timestamp);
+      // handleSeeked will call endSync
     });
+ 
     socket.on("sync-state", ({ isPlaying, timestamp }) => {
-      if (!videoRef.current) return;
-      isSyncing.current = true;
-      videoRef.current.currentTime = timestamp;
-      if (isPlaying) {
-        videoRef.current.play().finally(() => {
-          isSyncing.current = false;
-        });
-      } else {
-        videoRef.current.pause();
-        isSyncing.current = false;
+      if (streamPollRef.current) {
+        clearInterval(streamPollRef.current);
+        streamPollRef.current = null;
       }
       setIsReady(true);
-      loadPlayer();
+      setStatus("stream ready — syncing...");
+      loadPlayerWithSync({ isPlaying, timestamp });
     });
+ 
+    socket.on("room-info", ({ hostName: hn }) => {
+      if (hn) setHostName(hn);
+    });
+ 
     socket.on("member-joined", ({ memberName }) => {
       setMembers((prev) => [...prev, memberName]);
       setStatus(`${memberName} connected`);
     });
-    socket.on("member-left", () => setStatus("member disconnected"));
-
+ 
+    socket.on("member-left", ({ memberName }) => {
+      if (memberName) setMembers((prev) => prev.filter((m) => m !== memberName));
+      setStatus("member disconnected");
+    });
+ 
     fetch(`${BACKEND_URL}/room/${roomId}`)
       .then((r) => r.json())
       .then((data) => {
@@ -108,17 +146,27 @@ export default function RoomPage() {
           setIsReady(true);
           setStatus("stream ready");
           setTimeout(() => loadPlayer(), 500);
+        } else {
+          startStreamPoll();
         }
-      });
-
-    return () => socket.disconnect();
+        if (data.room?.members) {
+          const host = data.room.members.find((m) => m.isAdmin);
+          if (host) setHostName(host.name);
+        }
+      })
+      .catch(() => startStreamPoll());
+ 
+    return () => {
+      socket.disconnect();
+      if (streamPollRef.current) {
+        clearInterval(streamPollRef.current);
+        streamPollRef.current = null;
+      }
+    };
   }, [roomId]);
-
+ 
   function loadPlayer() {
-    if (!videoRef.current) {
-      setTimeout(() => loadPlayer(), 300);
-      return;
-    }
+    if (!videoRef.current) { setTimeout(() => loadPlayer(), 300); return; }
     const hlsUrl = `${FFMPEG_URL}/hls/${roomId}/index.m3u8`;
     if (hlsRef.current) hlsRef.current.destroy();
     if (Hls.isSupported()) {
@@ -137,29 +185,71 @@ export default function RoomPage() {
       videoRef.current.src = `${FFMPEG_URL}/hls/${roomId}/index.m3u8`;
     }
   }
-
+ 
+  function loadPlayerWithSync({ isPlaying, timestamp }) {
+    if (!videoRef.current) {
+      setTimeout(() => loadPlayerWithSync({ isPlaying, timestamp }), 300);
+      return;
+    }
+    const hlsUrl = `${FFMPEG_URL}/hls/${roomId}/index.m3u8`;
+    if (hlsRef.current) hlsRef.current.destroy();
+    if (Hls.isSupported()) {
+      const hls = new Hls({ liveSyncDurationCount: 3 });
+      hlsRef.current = hls;
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(videoRef.current);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        setStatus("stream ready — syncing...");
+        // seekTo increments syncDepth; handleSeeked will decrement it
+        seekTo(timestamp);
+        if (isPlaying) {
+          beginSync();
+          videoRef.current.play().finally(() => {
+            endSync();
+            setStatus("▶ playing");
+          });
+        } else {
+          videoRef.current.pause();
+          setStatus("⏸ paused");
+        }
+      });
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          setStatus("waiting for stream...");
+          setTimeout(() => hls.loadSource(hlsUrl), 3000);
+        }
+      });
+    } else if (videoRef.current.canPlayType("application/vnd.apple.mpegurl")) {
+      videoRef.current.src = hlsUrl;
+      videoRef.current.addEventListener("loadedmetadata", () => {
+        seekTo(timestamp);
+        if (isPlaying) {
+          beginSync();
+          videoRef.current.play().finally(() => endSync());
+        }
+      }, { once: true });
+    }
+  }
+ 
   function handlePlay() {
-    if (isSyncing.current || !socketRef.current) return;
-    socketRef.current.emit("play", {
-      roomId,
-      timestamp: videoRef.current.currentTime,
-    });
+    if (isSyncing() || !socketRef.current) return;
+    socketRef.current.emit("play", { roomId, timestamp: videoRef.current.currentTime });
   }
   function handlePause() {
-    if (isSyncing.current || !socketRef.current) return;
-    socketRef.current.emit("pause", {
-      roomId,
-      timestamp: videoRef.current.currentTime,
-    });
+    if (isSyncing() || !socketRef.current) return;
+    socketRef.current.emit("pause", { roomId, timestamp: videoRef.current.currentTime });
   }
   function handleSeeked() {
-    if (isSyncing.current || !socketRef.current) return;
-    socketRef.current.emit("seek", {
-      roomId,
-      timestamp: videoRef.current.currentTime,
-    });
+    // ALWAYS decrement first — this event fires for every seekTo()
+    if (syncDepth.current > 0) {
+      endSync();
+      return; // was programmatic, don't emit
+    }
+    // syncDepth is 0 → user-initiated seek
+    if (!socketRef.current) return;
+    socketRef.current.emit("seek", { roomId, timestamp: videoRef.current.currentTime });
   }
-
+ 
   async function handleUpload(file) {
     if (!file) return;
     setUploading(true);
@@ -189,32 +279,18 @@ export default function RoomPage() {
     });
     setUploading(false);
     setStatus("processing video...");
-    const poll = setInterval(() => {
-      fetch(`${BACKEND_URL}/room/${roomId}`)
-        .then((r) => r.json())
-        .then((data) => {
-          if (data.room?.isReady) {
-            clearInterval(poll);
-            setIsReady(true);
-            loadPlayer();
-          }
-        });
-    }, 2000);
+    startStreamPoll();
   }
-
+ 
   return (
     <div style={s.hud}>
       <div style={s.scanline} />
       {["tl", "tr", "bl", "br"].map((p) => (
         <div key={p} style={{ ...s.corner, ...s["c_" + p] }} />
       ))}
-
-      {/* TOPBAR */}
       <div style={s.topbar}>
         <div>
-          <div style={s.logo}>
-            STREAM<span style={{ color: "#39ff14" }}>SYNC</span>
-          </div>
+          <div style={s.logo}>STREAM<span style={{ color: "#39ff14" }}>SYNC</span></div>
           <div style={s.logoSub}>// room_id: {roomId}</div>
         </div>
         <div style={s.topbarMid}>
@@ -225,23 +301,16 @@ export default function RoomPage() {
         </div>
         <div style={s.topbarRight}>
           <div style={s.userChip}>
-            <span style={{ color: "rgba(0,255,65,0.4)" }}>
-              {isAdmin ? "[host]" : "[member]"}
-            </span>
+            <span style={{ color: "rgba(0,255,65,0.4)" }}>{isAdmin ? "[host]" : "[member]"}</span>
             <span style={{ marginLeft: 8 }}>{name}</span>
           </div>
-          <button
-            style={s.copyBtn}
-            onClick={() => navigator.clipboard.writeText(roomId)}
-          >
+          <button style={s.copyBtn} onClick={() => navigator.clipboard.writeText(roomId)}>
             cp room_id
           </button>
         </div>
       </div>
-
-      {/* BODY */}
+ 
       <div style={s.body}>
-        {/* VIDEO PANEL */}
         <div style={s.videoPanel}>
           <div style={s.videoLabel}>// video_feed</div>
           <div style={s.videoWrap}>
@@ -254,8 +323,6 @@ export default function RoomPage() {
               onSeeked={handleSeeked}
             />
           </div>
-
-          {/* UPLOAD */}
           {isAdmin && !isReady && (
             <div style={s.uploadBox}>
               {["tl", "tr", "bl", "br"].map((p) => (
@@ -277,14 +344,7 @@ export default function RoomPage() {
                   <div style={s.progressTrack}>
                     <div style={{ ...s.progressBar, width: `${progress}%` }} />
                   </div>
-                  <div
-                    style={{
-                      fontSize: 9,
-                      color: "rgba(0,255,65,0.4)",
-                      marginTop: 4,
-                      letterSpacing: 1,
-                    }}
-                  >
+                  <div style={{ fontSize: 9, color: "rgba(0,255,65,0.4)", marginTop: 4, letterSpacing: 1 }}>
                     {progress}% complete
                   </div>
                 </div>
@@ -292,27 +352,21 @@ export default function RoomPage() {
             </div>
           )}
         </div>
-
-        {/* SIDEBAR */}
+ 
         <div style={s.sidebar}>
           <div style={s.sideSection}>
             <div style={s.sideLabel}>members_list</div>
             <div style={s.memberItem}>
               <span style={{ color: "#39ff14" }}>[host]</span>
-              <span style={{ marginLeft: 8, color: "rgba(0,255,65,0.5)" }}>
-                host
-              </span>
+              <span style={{ marginLeft: 8, color: "rgba(0,255,65,0.5)" }}>{hostName}</span>
             </div>
             {members.map((m, i) => (
               <div key={i} style={s.memberItem}>
-                <span style={{ color: "rgba(0,255,65,0.4)" }}>
-                  [{String(i + 1).padStart(2, "0")}]
-                </span>
+                <span style={{ color: "rgba(0,255,65,0.4)" }}>[{String(i + 1).padStart(2, "0")}]</span>
                 <span style={{ marginLeft: 8 }}>{m}</span>
               </div>
             ))}
           </div>
-
           <div style={{ ...s.sideSection, marginTop: 20 }}>
             <div style={s.sideLabel}>sys_info</div>
             {[
@@ -323,20 +377,13 @@ export default function RoomPage() {
             ].map(([k, v]) => (
               <div key={k} style={s.sysRow}>
                 <span style={{ color: "rgba(0,255,65,0.35)" }}>{k}</span>
-                <span
-                  style={{
-                    color: v === "ready" ? "#39ff14" : "rgba(0,255,65,0.6)",
-                  }}
-                >
-                  {v}
-                </span>
+                <span style={{ color: v === "ready" ? "#39ff14" : "rgba(0,255,65,0.6)" }}>{v}</span>
               </div>
             ))}
           </div>
         </div>
       </div>
-
-      {/* FOOTER */}
+ 
       <div style={s.footer}>
         <span>streamsync // hls + websocket // ffmpeg → h264 → nginx</span>
         <span>{ts}</span>
@@ -344,190 +391,45 @@ export default function RoomPage() {
     </div>
   );
 }
-
+ 
 const s = {
-  hud: {
-    background: "#050806",
-    minHeight: "100vh",
-    fontFamily: "'JetBrains Mono',monospace",
-    color: "#00ff41",
-    position: "relative",
-    overflow: "hidden",
-    display: "flex",
-    flexDirection: "column",
-  },
-  scanline: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    background:
-      "repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,65,0.015) 2px,rgba(0,255,65,0.015) 4px)",
-    pointerEvents: "none",
-    zIndex: 0,
-  },
-  corner: {
-    position: "absolute",
-    width: 20,
-    height: 20,
-    borderColor: "#00ff41",
-    borderStyle: "solid",
-    opacity: 0.6,
-  },
+  hud: { background: "#050806", minHeight: "100vh", fontFamily: "'JetBrains Mono',monospace", color: "#00ff41", position: "relative", overflow: "hidden", display: "flex", flexDirection: "column" },
+  scanline: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, background: "repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,65,0.015) 2px,rgba(0,255,65,0.015) 4px)", pointerEvents: "none", zIndex: 0 },
+  corner: { position: "absolute", width: 20, height: 20, borderColor: "#00ff41", borderStyle: "solid", opacity: 0.6 },
   c_tl: { top: 8, left: 8, borderWidth: "1px 0 0 1px" },
   c_tr: { top: 8, right: 8, borderWidth: "1px 1px 0 0" },
   c_bl: { bottom: 8, left: 8, borderWidth: "0 0 1px 1px" },
   c_br: { bottom: 8, right: 8, borderWidth: "0 1px 1px 0" },
-  topbar: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: "12px 24px",
-    borderBottom: "1px solid rgba(0,255,65,0.2)",
-    position: "relative",
-    zIndex: 1,
-    gap: 16,
-  },
-  logo: {
-    fontSize: 16,
-    fontWeight: 700,
-    letterSpacing: 2,
-    color: "#00ff41",
-    textShadow: "0 0 8px rgba(0,255,65,0.4)",
-  },
-  logoSub: {
-    fontSize: 9,
-    color: "rgba(0,255,65,0.3)",
-    letterSpacing: 1,
-    marginTop: 2,
-  },
+  topbar: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 24px", borderBottom: "1px solid rgba(0,255,65,0.2)", position: "relative", zIndex: 1, gap: 16 },
+  logo: { fontSize: 16, fontWeight: 700, letterSpacing: 2, color: "#00ff41", textShadow: "0 0 8px rgba(0,255,65,0.4)" },
+  logoSub: { fontSize: 9, color: "rgba(0,255,65,0.3)", letterSpacing: 1, marginTop: 2 },
   topbarMid: { flex: 1, display: "flex", justifyContent: "center" },
-  statusChip: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    border: "1px solid rgba(0,255,65,0.2)",
-    padding: "4px 12px",
-    color: "rgba(0,255,65,0.6)",
-  },
+  statusChip: { display: "flex", alignItems: "center", gap: 8, border: "1px solid rgba(0,255,65,0.2)", padding: "4px 12px", color: "rgba(0,255,65,0.6)" },
   statusDot: { width: 5, height: 5, background: "#00ff41" },
   topbarRight: { display: "flex", alignItems: "center", gap: 12 },
   userChip: { fontSize: 10, letterSpacing: 1 },
-  copyBtn: {
-    background: "transparent",
-    border: "1px solid rgba(0,255,65,0.3)",
-    color: "rgba(0,255,65,0.5)",
-    fontFamily: "'JetBrains Mono',monospace",
-    fontSize: 9,
-    padding: "4px 10px",
-    cursor: "pointer",
-    letterSpacing: 1,
-    textTransform: "uppercase",
-  },
-  body: {
-    display: "grid",
-    gridTemplateColumns: "1fr 200px",
-    flex: 1,
-    gap: 0,
-    position: "relative",
-    zIndex: 1,
-  },
-  videoPanel: {
-    padding: 20,
-    display: "flex",
-    flexDirection: "column",
-    gap: 12,
-    minWidth: 0,
-  },
-  videoLabel: {
-    fontSize: 9,
-    color: "rgba(0,255,65,0.3)",
-    letterSpacing: 2,
-    marginBottom: 4,
-  },
-  videoWrap: {
-    border: "1px solid rgba(0,255,65,0.2)",
-    background: "#000",
-    aspectRatio: "16/9",
-    overflow: "hidden",
-  },
+  copyBtn: { background: "transparent", border: "1px solid rgba(0,255,65,0.3)", color: "rgba(0,255,65,0.5)", fontFamily: "'JetBrains Mono',monospace", fontSize: 9, padding: "4px 10px", cursor: "pointer", letterSpacing: 1, textTransform: "uppercase" },
+  body: { display: "grid", gridTemplateColumns: "1fr 200px", flex: 1, gap: 0, position: "relative", zIndex: 1 },
+  videoPanel: { padding: 20, display: "flex", flexDirection: "column", gap: 12, minWidth: 0 },
+  videoLabel: { fontSize: 9, color: "rgba(0,255,65,0.3)", letterSpacing: 2, marginBottom: 4 },
+  videoWrap: { border: "1px solid rgba(0,255,65,0.2)", background: "#000", aspectRatio: "16/9", overflow: "hidden" },
   video: { width: "100%", height: "100%", display: "block" },
-  uploadBox: {
-    border: "1px solid rgba(0,255,65,0.2)",
-    padding: 16,
-    position: "relative",
-  },
-  bc: {
-    position: "absolute",
-    width: 8,
-    height: 8,
-    borderColor: "#00ff41",
-    borderStyle: "solid",
-    opacity: 0.4,
-  },
+  uploadBox: { border: "1px solid rgba(0,255,65,0.2)", padding: 16, position: "relative" },
+  bc: { position: "absolute", width: 8, height: 8, borderColor: "#00ff41", borderStyle: "solid", opacity: 0.4 },
   bc_tl: { top: -1, left: -1, borderWidth: "2px 0 0 2px" },
   bc_tr: { top: -1, right: -1, borderWidth: "2px 2px 0 0" },
   bc_bl: { bottom: -1, left: -1, borderWidth: "0 0 2px 2px" },
   bc_br: { bottom: -1, right: -1, borderWidth: "0 2px 2px 0" },
-  uploadLabel: {
-    fontSize: 9,
-    color: "rgba(0,255,65,0.4)",
-    letterSpacing: 2,
-    textTransform: "uppercase",
-    marginBottom: 12,
-  },
+  uploadLabel: { fontSize: 9, color: "rgba(0,255,65,0.4)", letterSpacing: 2, textTransform: "uppercase", marginBottom: 12 },
   fileLabel: { cursor: "pointer" },
-  fileBtn: {
-    display: "inline-block",
-    border: "1px solid rgba(0,255,65,0.3)",
-    color: "rgba(0,255,65,0.6)",
-    fontSize: 10,
-    padding: "6px 14px",
-    letterSpacing: 1,
-    fontFamily: "'JetBrains Mono',monospace",
-  },
+  fileBtn: { display: "inline-block", border: "1px solid rgba(0,255,65,0.3)", color: "rgba(0,255,65,0.6)", fontSize: 10, padding: "6px 14px", letterSpacing: 1, fontFamily: "'JetBrains Mono',monospace" },
   progressTrack: { background: "rgba(0,255,65,0.1)", height: 2, width: "100%" },
   progressBar: { background: "#00ff41", height: 2, transition: "width 0.3s" },
-  sidebar: {
-    borderLeft: "1px solid rgba(0,255,65,0.15)",
-    padding: 16,
-    display: "flex",
-    flexDirection: "column",
-  },
+  sidebar: { borderLeft: "1px solid rgba(0,255,65,0.15)", padding: 16, display: "flex", flexDirection: "column" },
   sideSection: {},
-  sideLabel: {
-    fontSize: 9,
-    letterSpacing: 2,
-    color: "rgba(0,255,65,0.35)",
-    textTransform: "uppercase",
-    marginBottom: 10,
-    paddingBottom: 6,
-    borderBottom: "1px solid rgba(0,255,65,0.1)",
-  },
-  memberItem: {
-    fontSize: 11,
-    padding: "5px 0",
-    borderBottom: "1px solid rgba(0,255,65,0.06)",
-    display: "flex",
-    alignItems: "center",
-  },
-  sysRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    fontSize: 10,
-    padding: "4px 0",
-    borderBottom: "1px solid rgba(0,255,65,0.06)",
-  },
-  footer: {
-    fontSize: 9,
-    color: "rgba(0,255,65,0.15)",
-    letterSpacing: 1,
-    padding: "8px 24px",
-    borderTop: "1px solid rgba(0,255,65,0.1)",
-    display: "flex",
-    justifyContent: "space-between",
-    position: "relative",
-    zIndex: 1,
-  },
+  sideLabel: { fontSize: 9, letterSpacing: 2, color: "rgba(0,255,65,0.35)", textTransform: "uppercase", marginBottom: 10, paddingBottom: 6, borderBottom: "1px solid rgba(0,255,65,0.1)" },
+  memberItem: { fontSize: 11, padding: "5px 0", borderBottom: "1px solid rgba(0,255,65,0.06)", display: "flex", alignItems: "center" },
+  sysRow: { display: "flex", justifyContent: "space-between", fontSize: 10, padding: "4px 0", borderBottom: "1px solid rgba(0,255,65,0.06)" },
+  footer: { fontSize: 9, color: "rgba(0,255,65,0.15)", letterSpacing: 1, padding: "8px 24px", borderTop: "1px solid rgba(0,255,65,0.1)", display: "flex", justifyContent: "space-between", position: "relative", zIndex: 1 },
 };
+;;

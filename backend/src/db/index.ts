@@ -18,7 +18,7 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS members (
-    member_id             TEXT PRIMARY KEY,
+    member_id             TEXT NOT NULL,
     room_id                TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
     name                   TEXT NOT NULL,
     is_admin               INTEGER NOT NULL DEFAULT 0,
@@ -26,6 +26,7 @@ db.exec(`
     can_upload             INTEGER NOT NULL DEFAULT 0,
     joined_at              INTEGER NOT NULL,
     last_seen              INTEGER NOT NULL
+    PRIMARY KEY (member_id, room_id)
   );
 
   CREATE TABLE IF NOT EXISTS playback_state (

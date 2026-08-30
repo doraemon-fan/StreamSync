@@ -1,0 +1,343 @@
+/* ═══════════════════════════════════════════════════
+   StreamSync — Room Page
+   ═══════════════════════════════════════════════════ */
+
+.room-page {
+  min-height: 100vh;
+  background: var(--bg-base);
+  padding: 1.5rem;
+  animation: fadeIn 0.4s ease;
+}
+
+/* ── Header ───────────────────────────────────────── */
+.room-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1.5rem;
+  animation: fadeInDown 0.5s ease;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.room-header-left {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.room-title {
+  font-size: 1.5rem;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.room-id-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  padding: 0.3rem 0.75rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.room-id-chip:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-active);
+  color: var(--text-primary);
+}
+.room-id-chip .copy-icon {
+  opacity: 0.5;
+  transition: opacity var(--transition-fast);
+  font-size: 0.75rem;
+}
+.room-id-chip:hover .copy-icon { opacity: 1; }
+.room-id-chip.copied {
+  border-color: var(--success);
+  color: var(--success-light);
+}
+
+.room-user-info {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.room-header-right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.viewer-count {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-full);
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+}
+
+.connection-status {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: var(--radius-full);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+.connection-status.connected {
+  background: rgba(16, 185, 129, 0.1);
+  color: var(--success-light);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+}
+.connection-status.disconnected {
+  background: rgba(239, 68, 68, 0.1);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+/* ── Layout ───────────────────────────────────────── */
+.room-layout {
+  display: grid;
+  grid-template-columns: 1fr 300px;
+  gap: 1.5rem;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .room-layout { grid-template-columns: 1fr; }
+}
+
+/* ── Video ────────────────────────────────────────── */
+.video-container {
+  background: #000;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: var(--shadow-lg), var(--shadow-glow);
+  position: relative;
+  animation: scaleIn 0.5s ease;
+}
+
+.video-container video {
+  width: 100%;
+  display: block;
+  aspect-ratio: 16 / 9;
+  background: #000;
+}
+
+/* ── Upload ───────────────────────────────────────── */
+.upload-area {
+  padding: 3rem 2rem;
+  text-align: center;
+  animation: fadeInUp 0.6s ease;
+}
+
+.upload-dropzone {
+  border: 2px dashed var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: 3rem 2rem;
+  cursor: pointer;
+  transition: all var(--transition-base);
+}
+.upload-dropzone:hover,
+.upload-dropzone.drag-over {
+  border-color: var(--primary);
+  background: rgba(99, 102, 241, 0.05);
+}
+.upload-dropzone.drag-over {
+  transform: scale(1.01);
+  box-shadow: 0 0 30px rgba(99, 102, 241, 0.15);
+}
+
+.upload-icon {
+  font-size: 3.5rem;
+  margin-bottom: 1rem;
+  display: block;
+  animation: float 3s ease-in-out infinite;
+}
+
+.upload-title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+  color: var(--text-primary);
+}
+
+.upload-hint {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 1.5rem;
+}
+
+/* ── Upload Progress ──────────────────────────────── */
+.upload-progress {
+  padding: 3rem 2rem;
+  text-align: center;
+  animation: fadeIn 0.3s ease;
+}
+
+.upload-progress-icon {
+  font-size: 2.5rem;
+  margin-bottom: 1rem;
+  display: block;
+  animation: pulse 2s ease infinite;
+}
+
+.upload-progress-text {
+  font-size: 1.3rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+
+.upload-progress-sub {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  margin-bottom: 1.25rem;
+}
+
+.upload-progress .progress-track {
+  height: 8px;
+  margin-bottom: 1rem;
+}
+
+.transcoding-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  color: var(--accent-light);
+  font-size: 0.9rem;
+  font-weight: 500;
+  animation: fadeIn 0.5s ease;
+}
+
+.transcoding-spinner {
+  width: 16px; height: 16px;
+  border: 2px solid rgba(168, 85, 247, 0.3);
+  border-top-color: var(--accent-light);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* ── Waiting ──────────────────────────────────────── */
+.waiting-area {
+  padding: 4rem 2rem;
+  text-align: center;
+  animation: fadeIn 0.5s ease;
+}
+
+.waiting-icon {
+  font-size: 3.5rem;
+  margin-bottom: 1rem;
+  display: block;
+  animation: pulse 2.5s ease-in-out infinite;
+}
+
+.waiting-title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 0.35rem;
+}
+
+.waiting-hint {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+/* ── Sidebar ──────────────────────────────────────── */
+.room-sidebar {
+  padding: 1.25rem;
+  height: fit-content;
+  position: sticky;
+  top: 1.5rem;
+  animation: slideInRight 0.5s ease;
+}
+
+.sidebar-title {
+  font-size: 0.85rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.member-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.member-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  transition: background var(--transition-fast);
+}
+.member-item:hover { background: var(--bg-surface-hover); }
+
+.member-avatar {
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  background: var(--gradient-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: white;
+  flex-shrink: 0;
+}
+
+.member-info { flex: 1; min-width: 0; }
+
+.member-name {
+  font-size: 0.9rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.member-role { font-size: 0.7rem; }
+
+/* ── Room Info ────────────────────────────────────── */
+.room-info-section {
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.room-info-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.4rem 0;
+  font-size: 0.8rem;
+}
+.room-info-label { color: var(--text-muted); }
+.room-info-value { color: var(--text-secondary); font-weight: 500; }

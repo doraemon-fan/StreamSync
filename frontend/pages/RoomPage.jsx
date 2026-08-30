@@ -1,435 +1,409 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useParams, useSearchParams, useNavigate } from 'react-router-dom';
+import { BACKEND_URL, FFMPEG_URL } from '../src/config';
+import { io as socketIO } from 'socket.io-client';
+import Hls from 'hls.js';
+import '../src/styles/RoomPage.css';
 
-import { useState, useEffect, useRef } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
-import { BACKEND_URL, FFMPEG_URL } from "../src/config";
-import { io } from "socket.io-client";
-import Hls from "hls.js";
- 
-const CHUNK_SIZE = 2 * 1024 * 1024;
- 
+const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
+const HLS_BASE = import.meta.env.VITE_HLS_URL || 'http://localhost:8080';
+
 export default function RoomPage() {
   const { roomId } = useParams();
-  const [searchParams] = useSearchParams();
-  const name = searchParams.get("name") || "guest";
-  const role = searchParams.get("role") || "member";
-  const isAdmin = role === "admin";
- 
-  const [status, setStatus] = useState("connecting...");
-  const [members, setMembers] = useState([]);
-  const [hostName, setHostName] = useState("host");
-  const [isReady, setIsReady] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [ts, setTs] = useState("");
- 
-  const videoRef = useRef(null);
-  const socketRef = useRef(null);
-  // FIX: counter instead of boolean — survives async seek events
-  const syncDepth = useRef(0);
-  const hlsRef = useRef(null);
-  const streamPollRef = useRef(null);
- 
-  // helpers — every programmatic video touch must wrap with these
-  function beginSync() { syncDepth.current += 1; }
-  function endSync()   { if (syncDepth.current > 0) syncDepth.current -= 1; }
-  function isSyncing() { return syncDepth.current > 0; }
- 
-  // seekTo: sets currentTime and accounts for the seeked event that will fire
-  function seekTo(timestamp) {
-    beginSync(); // will be decremented in handleSeeked
-    videoRef.current.currentTime = timestamp;
-  }
- 
-  function startStreamPoll() {
-    if (streamPollRef.current) return;
-    streamPollRef.current = setInterval(() => {
-      fetch(`${BACKEND_URL}/room/${roomId}`)
-        .then((r) => r.json())
-        .then((d) => {
-          if (d.room?.isReady) {
-            clearInterval(streamPollRef.current);
-            streamPollRef.current = null;
-            setIsReady(true);
-            setStatus("stream ready — loading player");
-            loadPlayer();
-          }
-        })
-        .catch(() => {});
-    }, 2000);
-  }
- 
+  const [params] = useSearchParams();
+  const navigate = useNavigate();
+  const memberName = params.get('name');
+  const role = params.get('role') || 'member';
+
+  // Redirect if missing params
   useEffect(() => {
-    setTs(new Date().toISOString().slice(0, 19).replace("T", " "));
-    if (isAdmin) setHostName(name);
- 
-    const socket = io(BACKEND_URL);
+    if (!memberName || !roomId) navigate('/');
+  }, [memberName, roomId, navigate]);
+
+  // ─── State ──────────────────────────────────
+  const [members, setMembers] = useState([]);
+  const [isReady, setIsReady] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(null); // null | { percent, status }
+  const [transcodingInfo, setTranscodingInfo] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  // ─── Refs ───────────────────────────────────
+  const socketRef = useRef(null);
+  const hlsRef = useRef(null);
+  const videoRef = useRef(null);
+  const ignoreEventsRef = useRef(0); // counter-based guard vs setTimeout
+  const fileInputRef = useRef(null);
+
+  // ─── Socket Setup ──────────────────────────
+  useEffect(() => {
+    if (!memberName || !roomId) return;
+
+    const socket = socketIO(BACKEND_URL, { transports: ['websocket'] });
     socketRef.current = socket;
- 
-    socket.on("connect", () => {
-      socket.emit("join-room", { roomId, memberName: name });
-      setStatus("joined room — waiting for stream");
+
+    socket.on('connect', () => {
+      setConnected(true);
+      socket.emit('join-room', { roomId, memberName });
     });
- 
-    socket.on("stream-ready", () => {
-      if (streamPollRef.current) {
-        clearInterval(streamPollRef.current);
-        streamPollRef.current = null;
+
+    socket.on('disconnect', () => setConnected(false));
+
+    // Sync state from server on join
+    socket.on('sync-state', ({ isPlaying, timestamp, isReady: ready }) => {
+      setIsReady(ready);
+      const vid = videoRef.current;
+      if (vid && ready) {
+        vid.currentTime = timestamp;
+        if (isPlaying) vid.play().catch(() => {});
       }
+    });
+
+    // Stream ready — start HLS
+    socket.on('stream-ready', () => {
       setIsReady(true);
-      setStatus("stream ready — loading player");
-      loadPlayer();
+      loadHls();
     });
- 
-    socket.on("play", ({ timestamp }) => {
-      if (!videoRef.current) return;
-      if (!hlsRef.current) {
-        loadPlayer();
-        setTimeout(() => {
-          beginSync();
-          seekTo(timestamp);
-          videoRef.current.play().finally(() => endSync());
-        }, 1000);
-        return;
-      }
-      beginSync();
-      seekTo(timestamp);
-      videoRef.current.play().finally(() => endSync());
-      setStatus("▶ playing");
+
+    // Playback sync
+    function handlePlay({ timestamp }) {
+      const vid = videoRef.current;
+      if (!vid) return;
+      ignoreEventsRef.current++;
+      vid.currentTime = timestamp;
+      vid.play().catch(() => {});
+      setTimeout(() => { ignoreEventsRef.current = Math.max(0, ignoreEventsRef.current - 1); }, 300);
+    }
+    function handlePause({ timestamp }) {
+      const vid = videoRef.current;
+      if (!vid) return;
+      ignoreEventsRef.current++;
+      vid.currentTime = timestamp;
+      vid.pause();
+      setTimeout(() => { ignoreEventsRef.current = Math.max(0, ignoreEventsRef.current - 1); }, 300);
+    }
+    function handleSeek({ timestamp }) {
+      const vid = videoRef.current;
+      if (!vid) return;
+      ignoreEventsRef.current++;
+      vid.currentTime = timestamp;
+      setTimeout(() => { ignoreEventsRef.current = Math.max(0, ignoreEventsRef.current - 1); }, 300);
+    }
+
+    socket.on('play', handlePlay);
+    socket.on('pause', handlePause);
+    socket.on('seek', handleSeek);
+
+    // Members
+    socket.on('member-joined', ({ members: m }) => setMembers(m));
+    socket.on('member-left', ({ members: m }) => setMembers(m));
+
+    // Transcode progress
+    socket.on('transcode-progress', ({ totalSecs, fps, speed }) => {
+      setTranscodingInfo({ totalSecs: Math.round(totalSecs), fps, speed });
     });
- 
-    socket.on("pause", ({ timestamp }) => {
-      if (!videoRef.current) return;
-      if (!hlsRef.current) { loadPlayer(); return; }
-      beginSync();
-      seekTo(timestamp);
-      videoRef.current.pause();
-      // pause doesn't fire seeked so end immediately after seek lands
-      // handleSeeked will endSync for the seekTo, pause needs its own end
-      endSync();
-      setStatus("⏸ paused");
-    });
- 
-    socket.on("seek", ({ timestamp }) => {
-      if (!videoRef.current) return;
-      seekTo(timestamp);
-      // handleSeeked will call endSync
-    });
- 
-    socket.on("sync-state", ({ isPlaying, timestamp }) => {
-      if (streamPollRef.current) {
-        clearInterval(streamPollRef.current);
-        streamPollRef.current = null;
-      }
-      setIsReady(true);
-      setStatus("stream ready — syncing...");
-      loadPlayerWithSync({ isPlaying, timestamp });
-    });
- 
-    socket.on("room-info", ({ hostName: hn }) => {
-      if (hn) setHostName(hn);
-    });
- 
-    socket.on("member-joined", ({ memberName }) => {
-      setMembers((prev) => [...prev, memberName]);
-      setStatus(`${memberName} connected`);
-    });
- 
-    socket.on("member-left", ({ memberName }) => {
-      if (memberName) setMembers((prev) => prev.filter((m) => m !== memberName));
-      setStatus("member disconnected");
-    });
- 
-    fetch(`${BACKEND_URL}/room/${roomId}`)
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.room?.isReady) {
-          setIsReady(true);
-          setStatus("stream ready");
-          setTimeout(() => loadPlayer(), 500);
-        } else {
-          startStreamPoll();
-        }
-        if (data.room?.members) {
-          const host = data.room.members.find((m) => m.isAdmin);
-          if (host) setHostName(host.name);
-        }
-      })
-      .catch(() => startStreamPoll());
- 
+
+    socket.on('room-deleted', () => navigate('/'));
+
     return () => {
+      socket.off('connect');
+      socket.off('disconnect');
+      socket.off('sync-state');
+      socket.off('stream-ready');
+      socket.off('play', handlePlay);
+      socket.off('pause', handlePause);
+      socket.off('seek', handleSeek);
+      socket.off('member-joined');
+      socket.off('member-left');
+      socket.off('transcode-progress');
+      socket.off('room-deleted');
       socket.disconnect();
-      if (streamPollRef.current) {
-        clearInterval(streamPollRef.current);
-        streamPollRef.current = null;
+      socketRef.current = null;
+    };
+  }, [roomId, memberName]);
+
+  // ─── HLS Setup ────────────────────────────
+  const loadHls = useCallback(() => {
+    const vid = videoRef.current;
+    if (!vid) return;
+
+    // Destroy previous instance
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+
+    const hlsUrl = `${HLS_BASE}/hls/${roomId}/index.m3u8`;
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 6,
+        enableWorker: true,
+        lowLatencyMode: true,
+        manifestLoadPolicy: {
+          default: { maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 20000, timeoutRetry: { maxNumRetry: 4, retryDelayMs: 500, maxRetryDelayMs: 2000 }, errorRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 4000 } }
+        },
+      });
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(vid);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        vid.play().catch(() => {});
+      });
+      hlsRef.current = hls;
+    } else if (vid.canPlayType('application/vnd.apple.mpegurl')) {
+      // Native HLS (Safari)
+      vid.src = hlsUrl;
+      vid.addEventListener('loadedmetadata', () => vid.play().catch(() => {}));
+    }
+  }, [roomId]);
+
+  // Cleanup HLS on unmount
+  useEffect(() => {
+    return () => {
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
       }
     };
-  }, [roomId]);
- 
-  function loadPlayer() {
-    if (!videoRef.current) { setTimeout(() => loadPlayer(), 300); return; }
-    const hlsUrl = `${FFMPEG_URL}/hls/${roomId}/index.m3u8`;
-    if (hlsRef.current) hlsRef.current.destroy();
-    if (Hls.isSupported()) {
-      const hls = new Hls({ liveSyncDurationCount: 3 });
-      hlsRef.current = hls;
-      hls.loadSource(hlsUrl);
-      hls.attachMedia(videoRef.current);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => setStatus("stream ready"));
-      hls.on(Hls.Events.ERROR, (_, data) => {
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          setStatus("waiting for stream...");
-          setTimeout(() => hls.loadSource(hlsUrl), 3000);
-        }
-      });
-    } else if (videoRef.current.canPlayType("application/vnd.apple.mpegurl")) {
-      videoRef.current.src = `${FFMPEG_URL}/hls/${roomId}/index.m3u8`;
-    }
-  }
- 
-  function loadPlayerWithSync({ isPlaying, timestamp }) {
-    if (!videoRef.current) {
-      setTimeout(() => loadPlayerWithSync({ isPlaying, timestamp }), 300);
-      return;
-    }
-    const hlsUrl = `${FFMPEG_URL}/hls/${roomId}/index.m3u8`;
-    if (hlsRef.current) hlsRef.current.destroy();
-    if (Hls.isSupported()) {
-      const hls = new Hls({ liveSyncDurationCount: 3 });
-      hlsRef.current = hls;
-      hls.loadSource(hlsUrl);
-      hls.attachMedia(videoRef.current);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        setStatus("stream ready — syncing...");
-        // seekTo increments syncDepth; handleSeeked will decrement it
-        seekTo(timestamp);
-        if (isPlaying) {
-          beginSync();
-          videoRef.current.play().finally(() => {
-            endSync();
-            setStatus("▶ playing");
-          });
-        } else {
-          videoRef.current.pause();
-          setStatus("⏸ paused");
-        }
-      });
-      hls.on(Hls.Events.ERROR, (_, data) => {
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          setStatus("waiting for stream...");
-          setTimeout(() => hls.loadSource(hlsUrl), 3000);
-        }
-      });
-    } else if (videoRef.current.canPlayType("application/vnd.apple.mpegurl")) {
-      videoRef.current.src = hlsUrl;
-      videoRef.current.addEventListener("loadedmetadata", () => {
-        seekTo(timestamp);
-        if (isPlaying) {
-          beginSync();
-          videoRef.current.play().finally(() => endSync());
-        }
-      }, { once: true });
-    }
-  }
- 
-  function handlePlay() {
-    if (isSyncing() || !socketRef.current) return;
-    socketRef.current.emit("play", { roomId, timestamp: videoRef.current.currentTime });
-  }
-  function handlePause() {
-    if (isSyncing() || !socketRef.current) return;
-    socketRef.current.emit("pause", { roomId, timestamp: videoRef.current.currentTime });
-  }
-  function handleSeeked() {
-    // ALWAYS decrement first — this event fires for every seekTo()
-    if (syncDepth.current > 0) {
-      endSync();
-      return; // was programmatic, don't emit
-    }
-    // syncDepth is 0 → user-initiated seek
-    if (!socketRef.current) return;
-    socketRef.current.emit("seek", { roomId, timestamp: videoRef.current.currentTime });
-  }
- 
-  async function handleUpload(file) {
+  }, []);
+
+  // ─── Video Events → Socket ────────────────
+  const onPlay = () => {
+    if (ignoreEventsRef.current > 0) return;
+    socketRef.current?.emit('play', { roomId, timestamp: videoRef.current.currentTime });
+  };
+  const onPause = () => {
+    if (ignoreEventsRef.current > 0) return;
+    socketRef.current?.emit('pause', { roomId, timestamp: videoRef.current.currentTime });
+  };
+  const onSeeked = () => {
+    if (ignoreEventsRef.current > 0) return;
+    socketRef.current?.emit('seek', { roomId, timestamp: videoRef.current.currentTime });
+  };
+
+  // ─── File Upload ──────────────────────────
+  const handleFileSelect = async (file) => {
     if (!file) return;
-    setUploading(true);
-    setProgress(0);
-    setStatus("starting upload...");
-    const totalChunk = Math.ceil(file.size / CHUNK_SIZE);
-    await fetch(`${FFMPEG_URL}/upload/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ roomId, totalChunk, fileName: file.name }),
-    });
-    for (let i = 0; i < totalChunk; i++) {
-      const form = new FormData();
-      form.append("roomId", roomId);
-      form.append("chunkIndex", String(i));
-      form.append("totalChunk", String(totalChunk));
-      form.append("chunk", file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE));
-      await fetch(`${FFMPEG_URL}/upload/chunk`, { method: "POST", body: form });
-      const pct = Math.round(((i + 1) / totalChunk) * 100);
-      setProgress(pct);
-      setStatus(`uploading... ${pct}%`);
+
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    setUploadProgress({ percent: 0, status: 'Starting upload...' });
+
+    try {
+      // Start the transcode session
+      await fetch(`${FFMPEG_URL}/upload/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId, totalChunk: totalChunks, fileName: file.name }),
+      });
+
+      // Upload chunks
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const chunk = file.slice(start, end);
+
+        const formData = new FormData();
+        formData.append('chunk', chunk, `chunk_${i}`);
+        formData.append('roomId', roomId);
+        formData.append('chunkIndex', i.toString());
+
+        // Retry up to 3 times per chunk
+        let success = false;
+        for (let attempt = 0; attempt < 3 && !success; attempt++) {
+          try {
+            const res = await fetch(`${FFMPEG_URL}/upload/chunk`, { method: 'POST', body: formData });
+            if (res.ok) success = true;
+          } catch {
+            if (attempt === 2) throw new Error(`Failed to upload chunk ${i}`);
+            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+          }
+        }
+
+        const percent = Math.round(((i + 1) / totalChunks) * 100);
+        setUploadProgress({
+          percent,
+          status: percent === 100 ? 'Processing...' : `Uploading: ${percent}%`,
+        });
+      }
+
+      // Signal upload complete
+      await fetch(`${FFMPEG_URL}/upload/complete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId }),
+      });
+
+      setUploadProgress({ percent: 100, status: 'Transcoding...' });
+    } catch (err) {
+      setUploadProgress({ percent: 0, status: `Error: ${err.message}` });
     }
-    await fetch(`${FFMPEG_URL}/upload/complete`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ roomId }),
+  };
+
+  const onFileInputChange = (e) => {
+    handleFileSelect(e.target.files?.[0]);
+    e.target.value = '';
+  };
+
+  // ─── Drag & Drop ──────────────────────────
+  const onDragOver = (e) => { e.preventDefault(); setDragOver(true); };
+  const onDragLeave = () => setDragOver(false);
+  const onDrop = (e) => {
+    e.preventDefault();
+    setDragOver(false);
+    handleFileSelect(e.dataTransfer.files?.[0]);
+  };
+
+  // ─── Copy Room ID ─────────────────────────
+  const copyRoomId = () => {
+    navigator.clipboard.writeText(roomId).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     });
-    setUploading(false);
-    setStatus("processing video...");
-    startStreamPoll();
-  }
- 
+  };
+
+  // ─── Render ───────────────────────────────
+  if (!memberName) return null;
+
   return (
-    <div style={s.hud}>
-      <div style={s.scanline} />
-      {["tl", "tr", "bl", "br"].map((p) => (
-        <div key={p} style={{ ...s.corner, ...s["c_" + p] }} />
-      ))}
-      <div style={s.topbar}>
-        <div>
-          <div style={s.logo}>STREAM<span style={{ color: "#39ff14" }}>SYNC</span></div>
-          <div style={s.logoSub}>// room_id: {roomId}</div>
-        </div>
-        <div style={s.topbarMid}>
-          <div style={s.statusChip}>
-            <div style={s.statusDot} />
-            <span style={{ fontSize: 9, letterSpacing: 1 }}>{status}</span>
+    <div className="room-page">
+      {/* Header */}
+      <header className="room-header">
+        <div className="room-header-left">
+          <h1 className="room-title">
+            <span className="text-gradient">StreamSync</span>
+            <button
+              className={`room-id-chip ${copied ? 'copied' : ''}`}
+              onClick={copyRoomId}
+              title="Copy Room ID"
+            >
+              {copied ? '✓ Copied' : `#${roomId}`}
+              {!copied && <span className="copy-icon">📋</span>}
+            </button>
+          </h1>
+          <div className="room-user-info">
+            <span className="online-dot" />
+            <span>{memberName}</span>
+            <span className={`badge ${role === 'admin' ? 'badge-admin' : 'badge-member'}`}>
+              {role === 'admin' ? '👑 Admin' : '👤 Member'}
+            </span>
           </div>
         </div>
-        <div style={s.topbarRight}>
-          <div style={s.userChip}>
-            <span style={{ color: "rgba(0,255,65,0.4)" }}>{isAdmin ? "[host]" : "[member]"}</span>
-            <span style={{ marginLeft: 8 }}>{name}</span>
+
+        <div className="room-header-right">
+          <div className="viewer-count">
+            👥 {members.length || 1} viewer{(members.length || 1) !== 1 ? 's' : ''}
           </div>
-          <button style={s.copyBtn} onClick={() => navigator.clipboard.writeText(roomId)}>
-            cp room_id
-          </button>
+          <div className={`connection-status ${connected ? 'connected' : 'disconnected'}`}>
+            <span className="online-dot" style={connected ? {} : { background: 'var(--error)', boxShadow: '0 0 6px var(--error)' }} />
+            {connected ? 'Connected' : 'Reconnecting...'}
+          </div>
         </div>
-      </div>
- 
-      <div style={s.body}>
-        <div style={s.videoPanel}>
-          <div style={s.videoLabel}>// video_feed</div>
-          <div style={s.videoWrap}>
+      </header>
+
+      {/* Main Layout */}
+      <div className="room-layout">
+        {/* Video / Upload Area */}
+        <div className="glass-card video-container">
+          {isReady ? (
             <video
               ref={videoRef}
               controls
-              style={s.video}
-              onPlay={handlePlay}
-              onPause={handlePause}
-              onSeeked={handleSeeked}
+              onPlay={onPlay}
+              onPause={onPause}
+              onSeeked={onSeeked}
             />
-          </div>
-          {isAdmin && !isReady && (
-            <div style={s.uploadBox}>
-              {["tl", "tr", "bl", "br"].map((p) => (
-                <div key={p} style={{ ...s.bc, ...s["bc_" + p] }} />
-              ))}
-              <div style={s.uploadLabel}>upload_video --transcode</div>
-              <label style={s.fileLabel}>
-                <input
-                  type="file"
-                  accept="video/*"
-                  style={{ display: "none" }}
-                  onChange={(e) => handleUpload(e.target.files[0])}
-                  disabled={uploading}
-                />
-                <span style={s.fileBtn}>$ select_file</span>
-              </label>
-              {uploading && (
-                <div style={{ marginTop: 10 }}>
-                  <div style={s.progressTrack}>
-                    <div style={{ ...s.progressBar, width: `${progress}%` }} />
-                  </div>
-                  <div style={{ fontSize: 9, color: "rgba(0,255,65,0.4)", marginTop: 4, letterSpacing: 1 }}>
-                    {progress}% complete
-                  </div>
+          ) : uploadProgress ? (
+            /* Upload Progress */
+            <div className="upload-progress">
+              <span className="upload-progress-icon">🔄</span>
+              <div className="upload-progress-text">{uploadProgress.status}</div>
+              <div className="upload-progress-sub">
+                {uploadProgress.percent}% complete
+              </div>
+              <div className="progress-track">
+                <div className="progress-fill" style={{ width: `${uploadProgress.percent}%` }} />
+              </div>
+              {uploadProgress.percent === 100 && transcodingInfo && (
+                <div className="transcoding-status">
+                  <span className="transcoding-spinner" />
+                  Transcoded {transcodingInfo.totalSecs}s
+                  {transcodingInfo.speed && ` at ${transcodingInfo.speed}x`}
                 </div>
               )}
             </div>
+          ) : role === 'admin' ? (
+            /* Upload Dropzone (admin only) */
+            <div className="upload-area">
+              <div
+                className={`upload-dropzone ${dragOver ? 'drag-over' : ''}`}
+                onClick={() => fileInputRef.current?.click()}
+                onDragOver={onDragOver}
+                onDragLeave={onDragLeave}
+                onDrop={onDrop}
+              >
+                <span className="upload-icon">📤</span>
+                <div className="upload-title">Drop a video file here</div>
+                <div className="upload-hint">or click to browse — MP4, MKV, AVI, MOV</div>
+                <button className="btn btn-primary">Select Video</button>
+              </div>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="video/*"
+                onChange={onFileInputChange}
+                className="visually-hidden"
+              />
+            </div>
+          ) : (
+            /* Waiting (member) */
+            <div className="waiting-area">
+              <span className="waiting-icon">⏳</span>
+              <div className="waiting-title">Waiting for admin to upload a video...</div>
+              <div className="waiting-hint">The stream will start automatically</div>
+            </div>
           )}
         </div>
- 
-        <div style={s.sidebar}>
-          <div style={s.sideSection}>
-            <div style={s.sideLabel}>members_list</div>
-            <div style={s.memberItem}>
-              <span style={{ color: "#39ff14" }}>[host]</span>
-              <span style={{ marginLeft: 8, color: "rgba(0,255,65,0.5)" }}>{hostName}</span>
-            </div>
-            {members.map((m, i) => (
-              <div key={i} style={s.memberItem}>
-                <span style={{ color: "rgba(0,255,65,0.4)" }}>[{String(i + 1).padStart(2, "0")}]</span>
-                <span style={{ marginLeft: 8 }}>{m}</span>
+
+        {/* Sidebar */}
+        <div className="glass-card room-sidebar">
+          <h3 className="sidebar-title">👥 Members</h3>
+          <div className="member-list">
+            {(members.length > 0 ? members : [{ name: memberName, role }]).map((m, i) => (
+              <div key={m.name + i} className="member-item">
+                <div className="member-avatar" style={m.role === 'admin' ? { background: 'var(--gradient-accent)' } : {}}>
+                  {m.name?.charAt(0).toUpperCase()}
+                </div>
+                <div className="member-info">
+                  <div className="member-name">{m.name}</div>
+                  <span className={`badge ${m.role === 'admin' ? 'badge-admin' : 'badge-member'} member-role`}>
+                    {m.role === 'admin' ? '👑 Admin' : '👤 Member'}
+                  </span>
+                </div>
+                <span className="online-dot" />
               </div>
             ))}
           </div>
-          <div style={{ ...s.sideSection, marginTop: 20 }}>
-            <div style={s.sideLabel}>sys_info</div>
-            {[
-              ["room_id", roomId],
-              ["role", role],
-              ["stream", isReady ? "ready" : "pending"],
-              ["sync", "websocket"],
-            ].map(([k, v]) => (
-              <div key={k} style={s.sysRow}>
-                <span style={{ color: "rgba(0,255,65,0.35)" }}>{k}</span>
-                <span style={{ color: v === "ready" ? "#39ff14" : "rgba(0,255,65,0.6)" }}>{v}</span>
-              </div>
-            ))}
+
+          {/* Room Info */}
+          <div className="room-info-section">
+            <h3 className="sidebar-title">ℹ️ Room Info</h3>
+            <div className="room-info-item">
+              <span className="room-info-label">Status</span>
+              <span className="room-info-value">{isReady ? '🟢 Streaming' : '🟡 Waiting'}</span>
+            </div>
+            <div className="room-info-item">
+              <span className="room-info-label">Room ID</span>
+              <span className="room-info-value">{roomId}</span>
+            </div>
+            <div className="room-info-item">
+              <span className="room-info-label">Your Role</span>
+              <span className="room-info-value">{role === 'admin' ? 'Admin' : 'Member'}</span>
+            </div>
           </div>
         </div>
-      </div>
- 
-      <div style={s.footer}>
-        <span>streamsync // hls + websocket // ffmpeg → h264 → nginx</span>
-        <span>{ts}</span>
       </div>
     </div>
   );
 }
- 
-const s = {
-  hud: { background: "#050806", minHeight: "100vh", fontFamily: "'JetBrains Mono',monospace", color: "#00ff41", position: "relative", overflow: "hidden", display: "flex", flexDirection: "column" },
-  scanline: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, background: "repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,65,0.015) 2px,rgba(0,255,65,0.015) 4px)", pointerEvents: "none", zIndex: 0 },
-  corner: { position: "absolute", width: 20, height: 20, borderColor: "#00ff41", borderStyle: "solid", opacity: 0.6 },
-  c_tl: { top: 8, left: 8, borderWidth: "1px 0 0 1px" },
-  c_tr: { top: 8, right: 8, borderWidth: "1px 1px 0 0" },
-  c_bl: { bottom: 8, left: 8, borderWidth: "0 0 1px 1px" },
-  c_br: { bottom: 8, right: 8, borderWidth: "0 1px 1px 0" },
-  topbar: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 24px", borderBottom: "1px solid rgba(0,255,65,0.2)", position: "relative", zIndex: 1, gap: 16 },
-  logo: { fontSize: 16, fontWeight: 700, letterSpacing: 2, color: "#00ff41", textShadow: "0 0 8px rgba(0,255,65,0.4)" },
-  logoSub: { fontSize: 9, color: "rgba(0,255,65,0.3)", letterSpacing: 1, marginTop: 2 },
-  topbarMid: { flex: 1, display: "flex", justifyContent: "center" },
-  statusChip: { display: "flex", alignItems: "center", gap: 8, border: "1px solid rgba(0,255,65,0.2)", padding: "4px 12px", color: "rgba(0,255,65,0.6)" },
-  statusDot: { width: 5, height: 5, background: "#00ff41" },
-  topbarRight: { display: "flex", alignItems: "center", gap: 12 },
-  userChip: { fontSize: 10, letterSpacing: 1 },
-  copyBtn: { background: "transparent", border: "1px solid rgba(0,255,65,0.3)", color: "rgba(0,255,65,0.5)", fontFamily: "'JetBrains Mono',monospace", fontSize: 9, padding: "4px 10px", cursor: "pointer", letterSpacing: 1, textTransform: "uppercase" },
-  body: { display: "grid", gridTemplateColumns: "1fr 200px", flex: 1, gap: 0, position: "relative", zIndex: 1 },
-  videoPanel: { padding: 20, display: "flex", flexDirection: "column", gap: 12, minWidth: 0 },
-  videoLabel: { fontSize: 9, color: "rgba(0,255,65,0.3)", letterSpacing: 2, marginBottom: 4 },
-  videoWrap: { border: "1px solid rgba(0,255,65,0.2)", background: "#000", aspectRatio: "16/9", overflow: "hidden" },
-  video: { width: "100%", height: "100%", display: "block" },
-  uploadBox: { border: "1px solid rgba(0,255,65,0.2)", padding: 16, position: "relative" },
-  bc: { position: "absolute", width: 8, height: 8, borderColor: "#00ff41", borderStyle: "solid", opacity: 0.4 },
-  bc_tl: { top: -1, left: -1, borderWidth: "2px 0 0 2px" },
-  bc_tr: { top: -1, right: -1, borderWidth: "2px 2px 0 0" },
-  bc_bl: { bottom: -1, left: -1, borderWidth: "0 0 2px 2px" },
-  bc_br: { bottom: -1, right: -1, borderWidth: "0 2px 2px 0" },
-  uploadLabel: { fontSize: 9, color: "rgba(0,255,65,0.4)", letterSpacing: 2, textTransform: "uppercase", marginBottom: 12 },
-  fileLabel: { cursor: "pointer" },
-  fileBtn: { display: "inline-block", border: "1px solid rgba(0,255,65,0.3)", color: "rgba(0,255,65,0.6)", fontSize: 10, padding: "6px 14px", letterSpacing: 1, fontFamily: "'JetBrains Mono',monospace" },
-  progressTrack: { background: "rgba(0,255,65,0.1)", height: 2, width: "100%" },
-  progressBar: { background: "#00ff41", height: 2, transition: "width 0.3s" },
-  sidebar: { borderLeft: "1px solid rgba(0,255,65,0.15)", padding: 16, display: "flex", flexDirection: "column" },
-  sideSection: {},
-  sideLabel: { fontSize: 9, letterSpacing: 2, color: "rgba(0,255,65,0.35)", textTransform: "uppercase", marginBottom: 10, paddingBottom: 6, borderBottom: "1px solid rgba(0,255,65,0.1)" },
-  memberItem: { fontSize: 11, padding: "5px 0", borderBottom: "1px solid rgba(0,255,65,0.06)", display: "flex", alignItems: "center" },
-  sysRow: { display: "flex", justifyContent: "space-between", fontSize: 10, padding: "4px 0", borderBottom: "1px solid rgba(0,255,65,0.06)" },
-  footer: { fontSize: 9, color: "rgba(0,255,65,0.15)", letterSpacing: 1, padding: "8px 24px", borderTop: "1px solid rgba(0,255,65,0.1)", display: "flex", justifyContent: "space-between", position: "relative", zIndex: 1 },
-};
-;;

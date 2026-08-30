@@ -1,84 +1,106 @@
-import { db } from "../db";
-import crypto from "crypto";
+import { Room, RoomState, Member } from '../types/room';
+import { v4 as uuidv4 } from 'uuid';
 
-export const roomStore = {
-  create(roomId: string, adminName: string) {
-    const now = Date.now();
-    const adminId = crypto.randomUUID();
-    db.prepare(`INSERT INTO rooms (room_id, admin_id, created_at, last_active, is_ready)
-                VALUES (?, ?, ?, ?, 0)`).run(roomId, adminId, now, now);
-    db.prepare(`INSERT INTO members
-                (member_id, room_id, name, is_admin, can_control_playback, can_upload, joined_at, last_seen)
-                VALUES (?, ?, ?, 1, 1, 1, ?, ?)`).run(adminId, roomId, adminName, now, now);
-    return { roomId, adminId, ...this.get(roomId) };
-  },
+class RoomStore {
+    private rooms: Map<string, Room> = new Map();
+    private socketToRoom: Map<string, { roomId: string; memberName: string }> = new Map();
 
-  get(roomId: string) {
-    const room = db.prepare(`SELECT * FROM rooms WHERE room_id = ?`).get(roomId) as any;
-    if (!room) return undefined;
-    const members = db.prepare(`SELECT * FROM members WHERE room_id = ?`).all(roomId);
-    return { ...room, members };
-  },
+    createRoom(adminName: string): Room {
+        const roomId = uuidv4().slice(0, 8);
+        const room: Room = {
+            id: roomId,
+            admin: adminName,
+            members: [{
+                name: adminName,
+                socketId: null,
+                role: 'admin',
+            }],
+            isReady: false,
+            state: {
+                isPlaying: false,
+                timestamp: 0,
+                updatedAt: null,
+            },
+            createdAt: Date.now(),
+        };
+        this.rooms.set(roomId, room);
+        return room;
+    }
 
-  // memberId is now REQUIRED — generated client-side, persisted in localStorage,
-  // sent on every join (first time or reconnect). See note below on why.
-  join(roomId: string, memberId: string, memberName: string) {
-    const room = db.prepare(`SELECT room_id FROM rooms WHERE room_id = ?`).get(roomId);
-    if (!room) return null;
-    const now = Date.now();
-    db.prepare(`
-      INSERT INTO members (member_id, room_id, name, is_admin, can_control_playback, can_upload, joined_at, last_seen)
-      VALUES (?, ?, ?, 0, 0, 0, ?, ?)
-      ON CONFLICT(member_id) DO UPDATE SET name = excluded.name, last_seen = excluded.last_seen
-    `).run(memberId, roomId, memberName, now, now);
-    this.touch(roomId);
-    return this.get(roomId);
-  },
+    joinRoom(roomId: string, memberName: string): Room | null {
+        const room = this.rooms.get(roomId);
+        if (!room) return null;
 
-  touch(roomId: string) {
-    db.prepare(`UPDATE rooms SET last_active = ? WHERE room_id = ?`).run(Date.now(), roomId);
-  },
+        const existing = room.members.find(m => m.name === memberName);
+        if (!existing) {
+            room.members.push({
+                name: memberName,
+                socketId: null,
+                role: 'member',
+            });
+        }
+        return room;
+    }
 
-  markSeen(memberId: string, roomId: string) {
-    db.prepare(`UPDATE members SET last_seen = ? WHERE member_id = ?`).run(Date.now(), memberId);
-    this.touch(roomId);
-  },
+    bindSocket(roomId: string, memberName: string, socketId: string): void {
+        const room = this.rooms.get(roomId);
+        if (!room) return;
 
-  setReady(roomId: string) {
-    db.prepare(`UPDATE rooms SET is_ready = 1 WHERE room_id = ?`).run(roomId);
-  },
+        const member = room.members.find(m => m.name === memberName);
+        if (member) {
+            member.socketId = socketId;
+        }
+        this.socketToRoom.set(socketId, { roomId, memberName });
+    }
 
-  setPermissions(
-    roomId: string,
-    callerMemberId: string,
-    targetMemberId: string,
-    perms: { canControlPlayback?: boolean; canUpload?: boolean }
-  ) {
-    const caller = db.prepare(`SELECT is_admin FROM members WHERE member_id = ? AND room_id = ?`)
-      .get(callerMemberId, roomId) as { is_admin: number } | undefined;
-    if (!caller?.is_admin) throw new Error("only admin can grant permissions");
+    removeMemberBySocket(socketId: string): { roomId: string; memberName: string; room: Room } | null {
+        const mapping = this.socketToRoom.get(socketId);
+        if (!mapping) return null;
 
-    if (perms.canControlPlayback !== undefined)
-      db.prepare(`UPDATE members SET can_control_playback = ? WHERE member_id = ? AND room_id = ?`)
-        .run(perms.canControlPlayback ? 1 : 0, targetMemberId, roomId);
-    if (perms.canUpload !== undefined)
-      db.prepare(`UPDATE members SET can_upload = ? WHERE member_id = ? AND room_id = ?`)
-        .run(perms.canUpload ? 1 : 0, targetMemberId, roomId);
-  },
+        const { roomId, memberName } = mapping;
+        const room = this.rooms.get(roomId);
+        if (!room) {
+            this.socketToRoom.delete(socketId);
+            return null;
+        }
 
-  canControlPlayback(roomId: string, memberId: string) {
-    const m = db.prepare(`SELECT can_control_playback FROM members WHERE member_id = ? AND room_id = ?`)
-      .get(memberId, roomId) as { can_control_playback: number } | undefined;
-    return !!m?.can_control_playback;
-  },
+        room.members = room.members.filter(m => m.socketId !== socketId);
+        this.socketToRoom.delete(socketId);
 
-  canUpload(roomId: string, memberId: string) {
-    const m = db.prepare(`SELECT can_upload FROM members WHERE member_id = ? AND room_id = ?`)
-      .get(memberId, roomId) as { can_upload: number } | undefined;
-    return !!m?.can_upload;
-  },
+        return { roomId, memberName, room };
+    }
 
-  list() {
-    return db.prepare(`SELECT * FROM rooms`).all();
-  },
-};
+    getRoom(roomId: string): Room | null {
+        return this.rooms.get(roomId) || null;
+    }
+
+    isAdmin(roomId: string, memberName: string): boolean {
+        const room = this.rooms.get(roomId);
+        if (!room) return false;
+        return room.admin === memberName;
+    }
+
+    setReady(roomId: string): Room | null {
+        const room = this.rooms.get(roomId);
+        if (!room) return null;
+        room.isReady = true;
+        return room;
+    }
+
+    updateState(roomId: string, state: Partial<RoomState>): void {
+        const room = this.rooms.get(roomId);
+        if (room) {
+            room.state = { ...room.state, ...state };
+        }
+    }
+
+    deleteRoom(roomId: string): boolean {
+        return this.rooms.delete(roomId);
+    }
+
+    getSocketRoom(socketId: string): { roomId: string; memberName: string } | null {
+        return this.socketToRoom.get(socketId) || null;
+    }
+}
+
+export const roomStore = new RoomStore();

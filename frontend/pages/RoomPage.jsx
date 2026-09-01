@@ -13,7 +13,7 @@ export default function RoomPage() {
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const memberName = params.get('name');
-  const role = params.get('role') || 'member';
+  const initialRole = params.get('role') || 'member';
 
   // Redirect if missing params
   useEffect(() => {
@@ -22,19 +22,99 @@ export default function RoomPage() {
 
   // ─── State ──────────────────────────────────
   const [members, setMembers] = useState([]);
+  const [myRole, setMyRole] = useState(initialRole);
   const [isReady, setIsReady] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(null); // null | { percent, status }
+  const [uploadProgress, setUploadProgress] = useState(null);
   const [transcodingInfo, setTranscodingInfo] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [hlsError, setHlsError] = useState(null);
 
   // ─── Refs ───────────────────────────────────
   const socketRef = useRef(null);
   const hlsRef = useRef(null);
   const videoRef = useRef(null);
-  const ignoreEventsRef = useRef(0); // counter-based guard vs setTimeout
+  const ignoreEventsRef = useRef(0);
   const fileInputRef = useRef(null);
+  const hlsRetryTimerRef = useRef(null);
+
+  // ─── HLS Setup (extracted as stable function) ─────
+  const loadHls = useCallback(() => {
+    const vid = videoRef.current;
+    if (!vid) {
+      // Video element not mounted yet — retry shortly
+      if (hlsRetryTimerRef.current) clearTimeout(hlsRetryTimerRef.current);
+      hlsRetryTimerRef.current = setTimeout(() => loadHls(), 200);
+      return;
+    }
+
+    // Destroy previous instance
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+
+    setHlsError(null);
+    const hlsUrl = `${HLS_BASE}/hls/${roomId}/index.m3u8`;
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        startPosition: 0,
+        manifestLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 15000,
+            maxLoadTimeMs: 30000,
+            timeoutRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 4000 },
+            errorRetry: { maxNumRetry: 8, retryDelayMs: 1000, maxRetryDelayMs: 8000 },
+          },
+        },
+        playlistLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 15000,
+            maxLoadTimeMs: 30000,
+            timeoutRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 4000 },
+            errorRetry: { maxNumRetry: 8, retryDelayMs: 1000, maxRetryDelayMs: 8000 },
+          },
+        },
+        fragLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 15000,
+            maxLoadTimeMs: 60000,
+            timeoutRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 4000 },
+            errorRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 8000 },
+          },
+        },
+      });
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(vid);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        vid.play().catch(() => {});
+      });
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) {
+          console.error('HLS fatal error:', data.type, data.details);
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            setHlsError('Network error loading video. Retrying...');
+            setTimeout(() => hls.startLoad(), 3000);
+          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            setHlsError('Media error. Recovering...');
+            hls.recoverMediaError();
+          } else {
+            setHlsError('Failed to load video. Try refreshing.');
+          }
+        }
+      });
+      hlsRef.current = hls;
+    } else if (vid.canPlayType('application/vnd.apple.mpegurl')) {
+      vid.src = hlsUrl;
+      vid.addEventListener('loadedmetadata', () => vid.play().catch(() => {}));
+    }
+  }, [roomId]);
 
   // ─── Socket Setup ──────────────────────────
   useEffect(() => {
@@ -53,17 +133,24 @@ export default function RoomPage() {
     // Sync state from server on join
     socket.on('sync-state', ({ isPlaying, timestamp, isReady: ready }) => {
       setIsReady(ready);
-      const vid = videoRef.current;
-      if (vid && ready) {
-        vid.currentTime = timestamp;
-        if (isPlaying) vid.play().catch(() => {});
+      if (ready) {
+        // Use a small delay to let React render the <video> element first
+        setTimeout(() => {
+          loadHls();
+          const vid = videoRef.current;
+          if (vid) {
+            vid.currentTime = timestamp;
+            if (isPlaying) vid.play().catch(() => {});
+          }
+        }, 100);
       }
     });
 
     // Stream ready — start HLS
     socket.on('stream-ready', () => {
       setIsReady(true);
-      loadHls();
+      // Small delay so React renders <video> before we try to attach HLS
+      setTimeout(() => loadHls(), 100);
     });
 
     // Playback sync
@@ -96,8 +183,39 @@ export default function RoomPage() {
     socket.on('seek', handleSeek);
 
     // Members
-    socket.on('member-joined', ({ members: m }) => setMembers(m));
-    socket.on('member-left', ({ members: m }) => setMembers(m));
+    socket.on('member-joined', ({ members: m }) => {
+      setMembers(m);
+      // Update own role if it changed
+      const me = m.find(member => member.name === memberName);
+      if (me) setMyRole(me.role);
+    });
+    socket.on('member-left', ({ members: m }) => {
+      setMembers(m);
+      const me = m.find(member => member.name === memberName);
+      if (me) setMyRole(me.role);
+    });
+    socket.on('members-updated', ({ members: m }) => {
+      setMembers(m);
+      const me = m.find(member => member.name === memberName);
+      if (me) setMyRole(me.role);
+    });
+
+    // Kicked
+    socket.on('kicked', () => {
+      navigate('/');
+    });
+
+    // Room reset (admin re-uploads)
+    socket.on('room-reset', () => {
+      setIsReady(false);
+      setUploadProgress(null);
+      setTranscodingInfo(null);
+      setHlsError(null);
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+    });
 
     // Transcode progress
     socket.on('transcode-progress', ({ totalSecs, fps, speed }) => {
@@ -116,52 +234,20 @@ export default function RoomPage() {
       socket.off('seek', handleSeek);
       socket.off('member-joined');
       socket.off('member-left');
+      socket.off('members-updated');
+      socket.off('kicked');
+      socket.off('room-reset');
       socket.off('transcode-progress');
       socket.off('room-deleted');
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [roomId, memberName]);
-
-  // ─── HLS Setup ────────────────────────────
-  const loadHls = useCallback(() => {
-    const vid = videoRef.current;
-    if (!vid) return;
-
-    // Destroy previous instance
-    if (hlsRef.current) {
-      hlsRef.current.destroy();
-      hlsRef.current = null;
-    }
-
-    const hlsUrl = `${HLS_BASE}/hls/${roomId}/index.m3u8`;
-
-    if (Hls.isSupported()) {
-      const hls = new Hls({
-        liveSyncDurationCount: 3,
-        liveMaxLatencyDurationCount: 6,
-        enableWorker: true,
-        lowLatencyMode: true,
-        manifestLoadPolicy: {
-          default: { maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 20000, timeoutRetry: { maxNumRetry: 4, retryDelayMs: 500, maxRetryDelayMs: 2000 }, errorRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 4000 } }
-        },
-      });
-      hls.loadSource(hlsUrl);
-      hls.attachMedia(vid);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        vid.play().catch(() => {});
-      });
-      hlsRef.current = hls;
-    } else if (vid.canPlayType('application/vnd.apple.mpegurl')) {
-      // Native HLS (Safari)
-      vid.src = hlsUrl;
-      vid.addEventListener('loadedmetadata', () => vid.play().catch(() => {}));
-    }
-  }, [roomId]);
+  }, [roomId, memberName, loadHls, navigate]);
 
   // Cleanup HLS on unmount
   useEffect(() => {
     return () => {
+      if (hlsRetryTimerRef.current) clearTimeout(hlsRetryTimerRef.current);
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
@@ -189,16 +275,15 @@ export default function RoomPage() {
 
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     setUploadProgress({ percent: 0, status: 'Starting upload...' });
+    setTranscodingInfo(null);
 
     try {
-      // Start the transcode session
       await fetch(`${FFMPEG_URL}/upload/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId, totalChunk: totalChunks, fileName: file.name }),
       });
 
-      // Upload chunks
       for (let i = 0; i < totalChunks; i++) {
         const start = i * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, file.size);
@@ -209,7 +294,6 @@ export default function RoomPage() {
         formData.append('roomId', roomId);
         formData.append('chunkIndex', i.toString());
 
-        // Retry up to 3 times per chunk
         let success = false;
         for (let attempt = 0; attempt < 3 && !success; attempt++) {
           try {
@@ -224,18 +308,17 @@ export default function RoomPage() {
         const percent = Math.round(((i + 1) / totalChunks) * 100);
         setUploadProgress({
           percent,
-          status: percent === 100 ? 'Processing...' : `Uploading: ${percent}%`,
+          status: percent === 100 ? 'Upload complete. Transcoding...' : `Uploading: ${percent}%`,
         });
       }
 
-      // Signal upload complete
       await fetch(`${FFMPEG_URL}/upload/complete`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId }),
       });
 
-      setUploadProgress({ percent: 100, status: 'Transcoding...' });
+      setUploadProgress({ percent: 100, status: 'Transcoding video...' });
     } catch (err) {
       setUploadProgress({ percent: 0, status: `Error: ${err.message}` });
     }
@@ -263,8 +346,31 @@ export default function RoomPage() {
     });
   };
 
+  // ─── Leave Room ───────────────────────────
+  const leaveRoom = () => {
+    socketRef.current?.emit('leave-room', { roomId });
+    navigate('/');
+  };
+
+  // ─── Promote Member ───────────────────────
+  const promoteMember = (targetName) => {
+    socketRef.current?.emit('promote-member', { roomId, targetName });
+  };
+
+  // ─── Kick Member ──────────────────────────
+  const kickMember = (targetName) => {
+    socketRef.current?.emit('kick-member', { roomId, targetName });
+  };
+
+  // ─── Reset Room (re-upload) ───────────────
+  const resetRoom = () => {
+    socketRef.current?.emit('reset-room', { roomId });
+  };
+
   // ─── Render ───────────────────────────────
   if (!memberName) return null;
+
+  const isAdmin = myRole === 'admin';
 
   return (
     <div className="room-page">
@@ -285,8 +391,8 @@ export default function RoomPage() {
           <div className="room-user-info">
             <span className="online-dot" />
             <span>{memberName}</span>
-            <span className={`badge ${role === 'admin' ? 'badge-admin' : 'badge-member'}`}>
-              {role === 'admin' ? '👑 Admin' : '👤 Member'}
+            <span className={`badge ${isAdmin ? 'badge-admin' : 'badge-member'}`}>
+              {isAdmin ? '👑 Admin' : '👤 Member'}
             </span>
           </div>
         </div>
@@ -299,6 +405,9 @@ export default function RoomPage() {
             <span className="online-dot" style={connected ? {} : { background: 'var(--error)', boxShadow: '0 0 6px var(--error)' }} />
             {connected ? 'Connected' : 'Reconnecting...'}
           </div>
+          <button className="btn btn-leave" onClick={leaveRoom} title="Leave Room">
+            🚪 Leave
+          </button>
         </div>
       </header>
 
@@ -307,34 +416,50 @@ export default function RoomPage() {
         {/* Video / Upload Area */}
         <div className="glass-card video-container">
           {isReady ? (
-            <video
-              ref={videoRef}
-              controls
-              onPlay={onPlay}
-              onPause={onPause}
-              onSeeked={onSeeked}
-            />
+            <div className="video-wrapper">
+              <video
+                ref={videoRef}
+                controls
+                onPlay={onPlay}
+                onPause={onPause}
+                onSeeked={onSeeked}
+              />
+              {hlsError && (
+                <div className="hls-error-overlay">
+                  <span>⚠️ {hlsError}</span>
+                </div>
+              )}
+              {isAdmin && (
+                <button className="btn btn-reset" onClick={resetRoom} title="Upload new video">
+                  🔄 New Video
+                </button>
+              )}
+            </div>
           ) : uploadProgress ? (
-            /* Upload Progress */
             <div className="upload-progress">
-              <span className="upload-progress-icon">🔄</span>
+              <span className="upload-progress-icon">
+                {uploadProgress.percent < 100 ? '📤' : '⚙️'}
+              </span>
               <div className="upload-progress-text">{uploadProgress.status}</div>
               <div className="upload-progress-sub">
-                {uploadProgress.percent}% complete
+                {uploadProgress.percent < 100
+                  ? `${uploadProgress.percent}% uploaded`
+                  : 'Waiting for FFmpeg to produce playable segments...'
+                }
               </div>
               <div className="progress-track">
                 <div className="progress-fill" style={{ width: `${uploadProgress.percent}%` }} />
               </div>
-              {uploadProgress.percent === 100 && transcodingInfo && (
+              {transcodingInfo && (
                 <div className="transcoding-status">
                   <span className="transcoding-spinner" />
-                  Transcoded {transcodingInfo.totalSecs}s
-                  {transcodingInfo.speed && ` at ${transcodingInfo.speed}x`}
+                  Transcoded {transcodingInfo.totalSecs}s of video
+                  {transcodingInfo.speed && ` at ${transcodingInfo.speed}x speed`}
+                  {transcodingInfo.fps && ` (${transcodingInfo.fps} fps)`}
                 </div>
               )}
             </div>
-          ) : role === 'admin' ? (
-            /* Upload Dropzone (admin only) */
+          ) : isAdmin ? (
             <div className="upload-area">
               <div
                 className={`upload-dropzone ${dragOver ? 'drag-over' : ''}`}
@@ -357,7 +482,6 @@ export default function RoomPage() {
               />
             </div>
           ) : (
-            /* Waiting (member) */
             <div className="waiting-area">
               <span className="waiting-icon">⏳</span>
               <div className="waiting-title">Waiting for admin to upload a video...</div>
@@ -368,20 +492,41 @@ export default function RoomPage() {
 
         {/* Sidebar */}
         <div className="glass-card room-sidebar">
-          <h3 className="sidebar-title">👥 Members</h3>
+          <h3 className="sidebar-title">👥 Members ({members.length || 1})</h3>
           <div className="member-list">
-            {(members.length > 0 ? members : [{ name: memberName, role }]).map((m, i) => (
+            {(members.length > 0 ? members : [{ name: memberName, role: myRole }]).map((m, i) => (
               <div key={m.name + i} className="member-item">
                 <div className="member-avatar" style={m.role === 'admin' ? { background: 'var(--gradient-accent)' } : {}}>
                   {m.name?.charAt(0).toUpperCase()}
                 </div>
                 <div className="member-info">
-                  <div className="member-name">{m.name}</div>
+                  <div className="member-name">
+                    {m.name}
+                    {m.name === memberName && <span className="you-tag"> (you)</span>}
+                  </div>
                   <span className={`badge ${m.role === 'admin' ? 'badge-admin' : 'badge-member'} member-role`}>
                     {m.role === 'admin' ? '👑 Admin' : '👤 Member'}
                   </span>
                 </div>
-                <span className="online-dot" />
+                <div className="member-actions">
+                  <span className="online-dot" />
+                  {isAdmin && m.name !== memberName && (
+                    <div className="admin-controls">
+                      {m.role !== 'admin' && (
+                        <button
+                          className="member-action-btn promote"
+                          onClick={() => promoteMember(m.name)}
+                          title="Promote to Admin"
+                        >👑</button>
+                      )}
+                      <button
+                        className="member-action-btn kick"
+                        onClick={() => kickMember(m.name)}
+                        title="Kick from room"
+                      >✕</button>
+                    </div>
+                  )}
+                </div>
               </div>
             ))}
           </div>
@@ -399,7 +544,7 @@ export default function RoomPage() {
             </div>
             <div className="room-info-item">
               <span className="room-info-label">Your Role</span>
-              <span className="room-info-value">{role === 'admin' ? 'Admin' : 'Member'}</span>
+              <span className="room-info-value">{isAdmin ? 'Admin' : 'Member'}</span>
             </div>
           </div>
         </div>

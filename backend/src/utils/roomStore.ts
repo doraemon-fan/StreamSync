@@ -94,6 +94,17 @@ class RoomStore {
         }
     }
 
+    unbindSocket(socketId: string): void {
+        this.socketToRoom.delete(socketId);
+    }
+
+    resetRoom(roomId: string): void {
+        const room = this.rooms.get(roomId);
+        if (!room) return;
+        room.isReady = false;
+        room.state = { isPlaying: false, timestamp: 0, updatedAt: null };
+    }
+
     deleteRoom(roomId: string): boolean {
         return this.rooms.delete(roomId);
     }

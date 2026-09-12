@@ -112,6 +112,12 @@ export function registerSyncHandlers(io: Server, socket: Socket) {
         roomStore.resetRoom(roomId);
         io.to(roomId).emit('room-reset');
         console.log(`Room ${roomId} reset by admin ${info.memberName}`);
+
+        // Tell FFmpeg service to kill its old process and wipe HLS files
+        const ffmpegUrl = process.env.FFMPEG_URL || 'http://streamsync-ffmpeg:3000';
+        fetch(`${ffmpegUrl}/reset/${roomId}`, { method: 'POST' })
+            .then(() => console.log(`FFmpeg service reset for room ${roomId}`))
+            .catch(err => console.error('Failed to reset FFmpeg service:', err));
     });
 
     socket.on('disconnect', () => {

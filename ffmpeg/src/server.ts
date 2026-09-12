@@ -50,6 +50,71 @@ const sessions: Record<string, TranscodeSession> = {};
 // Backend URL for notifications
 const BACKEND_URL = process.env.BACKEND_URL || 'http://streamsync-backend:5000';
 
+// ─── Helper: kill & clean an existing session ──
+function destroySession(roomId: string): void {
+    const session = sessions[roomId];
+    if (!session) return;
+
+    console.log(`Destroying session for room ${roomId}`);
+
+    // Close file watcher
+    try { if (session.watcher) session.watcher.close(); } catch {}
+
+    // Unpipe first so we don't get EPIPE when we kill FFmpeg
+    try { session.inputStream.unpipe(); } catch {}
+
+    // Destroy the PassThrough stream
+    try { session.inputStream.destroy(); } catch {}
+
+    // Kill the FFmpeg process
+    try { session.ffmpegProcess.kill('SIGKILL'); } catch {}
+
+    delete sessions[roomId];
+}
+
+// ─── Helper: wipe HLS output directory ─────────
+function cleanHlsDir(roomId: string): void {
+    const hlsDir = path.join(HLS_DIR, roomId);
+    if (fs.existsSync(hlsDir)) {
+        fs.rmSync(hlsDir, { recursive: true, force: true });
+        console.log(`Cleaned HLS directory for room ${roomId}`);
+    }
+}
+
+// ─── Helper: safe write to session input stream ─
+function safeWrite(session: TranscodeSession, data: Buffer): boolean {
+    try {
+        if (session.inputStream.destroyed || session.inputStream.writableEnded) {
+            console.error('Cannot write — input stream is destroyed or ended');
+            return false;
+        }
+        session.inputStream.write(data);
+        return true;
+    } catch (err: any) {
+        if (err?.code === 'EPIPE' || err?.code === 'ERR_STREAM_DESTROYED') {
+            console.error('EPIPE/destroyed stream caught — session is stale');
+            return false;
+        }
+        throw err;
+    }
+}
+
+// ─── Reset endpoint (called by backend on room-reset) ──
+app.post('/reset/:roomId', (req, res): void => {
+    const { roomId } = req.params;
+    console.log(`Reset requested for room ${roomId}`);
+    destroySession(roomId);
+    cleanHlsDir(roomId);
+
+    // Also clean temp dir
+    const roomTempDir = path.join(TEMP_DIR, roomId);
+    if (fs.existsSync(roomTempDir)) {
+        fs.rmSync(roomTempDir, { recursive: true, force: true });
+    }
+
+    res.json({ ok: true });
+});
+
 // ─── Upload Start ──────────────────────────────
 // Spawns FFmpeg immediately — it reads from a PassThrough stream (stdin pipe)
 // and starts producing HLS segments as soon as it has enough data (~4s of video)
@@ -60,23 +125,22 @@ app.post('/upload/start', (req, res): void => {
         return;
     }
 
-    // Clean up any previous session for this room
-    if (sessions[roomId]) {
-        try {
-            sessions[roomId].inputStream.destroy();
-            sessions[roomId].ffmpegProcess.kill('SIGKILL');
-            if (sessions[roomId].watcher) sessions[roomId].watcher!.close();
-        } catch {}
-        delete sessions[roomId];
-    }
+    // Clean up any previous session AND old HLS files for this room
+    destroySession(roomId);
+    cleanHlsDir(roomId);
 
-    // Create HLS output directory
+    // Create fresh HLS output directory
     const hlsDir = path.join(HLS_DIR, roomId);
-    if (!fs.existsSync(hlsDir)) fs.mkdirSync(hlsDir, { recursive: true });
+    fs.mkdirSync(hlsDir, { recursive: true });
 
     // Create the PassThrough stream that FFmpeg will read from
     const inputStream = new PassThrough({
         highWaterMark: 4 * 1024 * 1024, // 4MB buffer
+    });
+
+    // Catch errors on the PassThrough so they don't crash the process
+    inputStream.on('error', (err) => {
+        console.error(`inputStream error for room ${roomId}:`, err.message);
     });
 
     // Spawn FFmpeg reading from stdin, outputting HLS segments
@@ -100,6 +164,11 @@ app.post('/upload/start', (req, res): void => {
 
     // Pipe our PassThrough stream into FFmpeg's stdin
     inputStream.pipe(ffmpegProcess.stdin!);
+
+    // Catch EPIPE on FFmpeg stdin so it doesn't crash the process
+    ffmpegProcess.stdin!.on('error', (err) => {
+        console.error(`FFmpeg stdin error for room ${roomId}:`, err.message);
+    });
 
     // Handle FFmpeg stderr for progress tracking
     let lastProgressNotify = 0;
@@ -189,8 +258,10 @@ app.post('/upload/start', (req, res): void => {
             sessions[roomId].watcher!.close();
         }
 
-        // Clean up session
-        delete sessions[roomId];
+        // Clean up session (only if this is still the same session)
+        if (sessions[roomId]?.ffmpegProcess === ffmpegProcess) {
+            delete sessions[roomId];
+        }
     });
 
     ffmpegProcess.on('error', (err) => {
@@ -203,7 +274,9 @@ app.post('/upload/start', (req, res): void => {
         if (sessions[roomId]?.watcher) {
             sessions[roomId].watcher!.close();
         }
-        delete sessions[roomId];
+        if (sessions[roomId]?.ffmpegProcess === ffmpegProcess) {
+            delete sessions[roomId];
+        }
     });
 
     sessions[roomId] = {
@@ -237,6 +310,8 @@ app.post('/upload/chunk', upload.single('chunk'), (req, res): void => {
 
     const session = sessions[roomId];
     if (!session) {
+        // Clean up the temp file multer wrote
+        try { if (file.path) fs.unlinkSync(file.path); } catch {}
         res.status(400).json({ error: 'No active session for this room. Call /upload/start first.' });
         return;
     }
@@ -251,13 +326,16 @@ app.post('/upload/chunk', upload.single('chunk'), (req, res): void => {
 
     if (idx === session.nextExpectedChunk) {
         // This is the next expected chunk — write it and flush any buffered ones
-        session.inputStream.write(chunkData);
+        if (!safeWrite(session, chunkData)) {
+            res.status(500).json({ error: 'FFmpeg pipe broken — session is stale' });
+            return;
+        }
         session.nextExpectedChunk++;
 
         // Flush any pending chunks that are now in order
         while (session.pendingChunks.has(session.nextExpectedChunk)) {
             const pending = session.pendingChunks.get(session.nextExpectedChunk)!;
-            session.inputStream.write(pending);
+            if (!safeWrite(session, pending)) break;
             session.pendingChunks.delete(session.nextExpectedChunk);
             session.nextExpectedChunk++;
         }
@@ -283,13 +361,13 @@ app.post('/upload/complete', (req, res): void => {
     // Flush any remaining pending chunks
     while (session.pendingChunks.has(session.nextExpectedChunk)) {
         const pending = session.pendingChunks.get(session.nextExpectedChunk)!;
-        session.inputStream.write(pending);
+        if (!safeWrite(session, pending)) break;
         session.pendingChunks.delete(session.nextExpectedChunk);
         session.nextExpectedChunk++;
     }
 
     // End the input stream — signals EOF to FFmpeg
-    session.inputStream.end();
+    try { session.inputStream.end(); } catch {}
 
     console.log(`Upload complete for room ${roomId}. FFmpeg will finish transcoding remaining data.`);
     res.json({ ok: true, message: 'Upload complete. Transcoding will finish shortly.' });
